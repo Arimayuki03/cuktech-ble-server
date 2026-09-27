@@ -3,3 +3,8 @@ paho-mqtt>=2.0
 bleak>=0.21
 cryptography>=41
 pyyaml>=6.0
+# 以下两项 xiaomi_cloud.py(小米云扫码登录)实际依赖,但上游 requirements.txt 曾遗漏:
+# 缺失时 ha_server.py 的 import 守卫会把 QrCodeXiaomiCloudClient 置为 None,
+# Web UI 点「获取二维码」静默返回 400("'NoneType' object is not callable")。2026-09-26 补录。
+requests>=2.31
+pycryptodome>=3.20

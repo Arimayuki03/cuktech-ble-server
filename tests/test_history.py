@@ -311,6 +311,62 @@ class TestChargeLimits:
         h2.close()
 
 
+class TestSessionAvgVi:
+    """会话均压/均流：闭合时从采样点重算 + 启动回填旧数据（摘要 0.0V 修复）。"""
+
+    def test_end_session_computes_avg_from_points(self, history):
+        """闭合会话时传入瞬时值 ≈0，落库应为采样点时间加权均值而非 0。"""
+        sid = history.start_session(1, protocol="PD")
+        # 恒定 20V/2.5A 采样：加权均值应为 20.0/2.5
+        for _ in range(5):
+            history.record_charge_point(sid, 20.0, 2.5, 50.0, "PD")
+        # 模拟旧 bug 调用：闭合瞬间电流已降为 0
+        history.end_session(sid, 1.0, 50.0, 0.0, 0.0, 600)
+
+        sessions, _ = history.get_sessions(port=1, period="all")
+        row = next(s for s in sessions if s["id"] == sid)
+        assert row["avg_voltage"] == pytest.approx(20.0, abs=0.01)
+        assert row["avg_current"] == pytest.approx(2.5, abs=0.01)
+
+    def test_end_session_falls_back_without_points(self, history):
+        """无采样点的会话回落使用传入值（行为与旧版一致）。"""
+        sid = history.start_session(1, protocol="PD")
+        history.end_session(sid, 1.0, 50.0, 20.0, 2.5, 600)
+        sessions, _ = history.get_sessions(port=1, period="all")
+        row = next(s for s in sessions if s["id"] == sid)
+        assert row["avg_voltage"] == pytest.approx(20.0, abs=0.01)
+        assert row["avg_current"] == pytest.approx(2.5, abs=0.01)
+
+    def test_backfill_fixes_zero_avg_sessions(self, temp_db):
+        """启动回填：旧数据 avg=0 但有采样点的会话被重算。"""
+        from history import PortHistory
+
+        h1 = PortHistory(db_path=temp_db, retention_days=2)
+        h1.connect()
+        sid = h1.start_session(2, protocol="PD")
+        for _ in range(4):
+            h1.record_charge_point(sid, 5.1, 1.2, 6.1, "PD")
+        # 直接写 0 模拟旧版落库（绕过新 end_session 逻辑；
+        # total_wh 需 >0 否则 get_sessions 的过滤会隐藏该会话）
+        h1._conn.execute(
+            """UPDATE charge_sessions SET end_time = ?, total_wh = 1.0,
+               avg_voltage = 0, avg_current = 0 WHERE id = ?""",
+            (time.time(), sid))
+        h1._conn.commit()
+        h1.close()
+
+        # 重连触发 _backfill_session_avg_vi
+        h2 = PortHistory(db_path=temp_db, retention_days=2)
+        h2.connect()
+        try:
+            sessions, _ = h2.get_sessions(port=2, period="all")
+            row = next(s for s in sessions if s["id"] == sid)
+            assert row["avg_voltage"] == pytest.approx(5.1, abs=0.01)
+            assert row["avg_current"] == pytest.approx(1.2, abs=0.01)
+        finally:
+            h2.close()
+
+
 class TestSessionCleanup:
     """会话清理（H5）：闭环会话过期回收 + 崩溃孤儿会话启动回收。"""
 

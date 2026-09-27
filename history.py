@@ -54,6 +54,7 @@ class PortHistory:
         self._conn.execute("PRAGMA synchronous=NORMAL")
         self._conn.execute("PRAGMA wal_autocheckpoint=1000")  # checkpoint every 1000 pages
         self._create_tables()
+        self._backfill_session_avg_vi()
         self._reap_orphan_sessions()
         self._cleanup_old_data()
         _LOGGER.info("History database connected: %s", self.db_path)
@@ -564,6 +565,74 @@ class PortHistory:
 
     # ── Charge Session Management ──
 
+    def _backfill_session_avg_vi(self):
+        """启动回填：历史会话 avg_voltage/avg_current 为 0 但有采样点的行，
+        从采样点重算真实均值（修复旧版闭合会话时写瞬时值/0 的问题）。
+
+        每次启动跑一遍，行数通常为 0（新版本已写对），代价一次索引查询。
+        """
+        if not self._conn:
+            return
+        with self._db_lock:
+            try:
+                rows = self._conn.execute(
+                    """SELECT DISTINCT cs.id
+                       FROM charge_sessions cs
+                       JOIN charge_points cp ON cp.session_id = cs.id
+                       WHERE cs.end_time IS NOT NULL
+                         AND cs.avg_voltage = 0 AND cs.avg_current = 0"""
+                ).fetchall()
+                fixed = 0
+                for row in rows:
+                    calc_v, calc_a = self._session_avg_vi(row["id"])
+                    if calc_v is None or calc_a is None:
+                        continue
+                    if calc_v <= 0 and calc_a <= 0:
+                        continue
+                    self._conn.execute(
+                        """UPDATE charge_sessions
+                           SET avg_voltage = ?, avg_current = ? WHERE id = ?""",
+                        (round(calc_v, 2), round(calc_a, 2), row["id"]))
+                    fixed += 1
+                if fixed:
+                    self._conn.commit()
+                    _LOGGER.info("Backfilled avg V/A for %d sessions", fixed)
+            except Exception as e:
+                _LOGGER.error("Failed to backfill session avg V/A: %s", e)
+
+    def _session_avg_vi(self, session_id: int) -> tuple:
+        """从会话采样点计算时间加权均压/均流（梯形加权，与桌面端
+        _compute_session_metrics 口径一致）。
+
+        无采样点返回 (None, None)（调用方回落使用传入值）；单点或
+        零跨度退化为算术平均。
+        """
+        if not self._conn:
+            return None, None
+        rows = self._conn.execute(
+            """SELECT timestamp, voltage, current
+               FROM charge_points WHERE session_id = ? ORDER BY timestamp""",
+            (session_id,),
+        ).fetchall()
+        pts = [(float(r["timestamp"]), float(r["voltage"] or 0.0),
+                float(r["current"] or 0.0)) for r in rows]
+        if not pts:
+            return None, None
+        if len(pts) == 1 or pts[-1][0] <= pts[0][0]:
+            n = len(pts)
+            return (sum(p[1] for p in pts) / n, sum(p[2] for p in pts) / n)
+        span = pts[-1][0] - pts[0][0]
+        wv = wa = 0.0
+        for (t0, v0, a0), (t1, v1, a1) in zip(pts, pts[1:]):
+            dt = t1 - t0
+            if dt <= 0 or dt > 1800:
+                # 时间倒退或采样断档（>30min）不参与加权（与桌面端
+                # _compute_session_metrics 口径一致）
+                continue
+            wv += (v0 + v1) / 2.0 * dt
+            wa += (a0 + a1) / 2.0 * dt
+        return wv / span, wa / span
+
     def start_session(self, port: int, protocol: str = "") -> int:
         """Start a new charge session, return session_id."""
         if not self._conn:
@@ -599,9 +668,19 @@ class PortHistory:
 
     def end_session(self, session_id: int, total_wh: float, peak_power_w: float,
                     avg_voltage: float, avg_current: float, duration_sec: int):
-        """End a charge session with final stats."""
+        """End a charge session with final stats.
+
+        avg_voltage/avg_current 传入值仅为回落：调用方多在断电/低电流
+        瞬间闭合会话，瞬时 V/A ≈ 0（写死 0 亦有），直接落库会让历史
+        摘要恒为 0。优先从本会话采样点重算时间加权均值。
+        """
         if not self._conn or not session_id:
             return
+        calc_v, calc_a = self._session_avg_vi(session_id)
+        if calc_v is not None:
+            avg_voltage = calc_v
+        if calc_a is not None:
+            avg_current = calc_a
         avg_power = total_wh / (duration_sec / 3600.0) if duration_sec > 0 else 0
         with self._db_lock:
             try:
