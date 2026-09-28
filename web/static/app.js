@@ -153,6 +153,7 @@
 
         async function setScene(mode) {
             markLocal();
+            const prevScene = lastScene;
             lastScene = mode;
             renderScene(lastSettings);
             try {
@@ -164,12 +165,16 @@
                 // 失败时回滚乐观更新，等下一次 settings 事件恢复真实状态
                 const result = await res.json();
                 if (!result.ok) {
-                    lastScene = null;
+                    // 回到失败前的真实值；置 null 会 fallback 到 SCENE_OPTIONS[0]
+                    lastScene = prevScene;
+                    renderScene(lastSettings);
                     showToast(I18N.t('common.setFailed', { msg: result.error || I18N.t('common.unknownError') }));
                 }
             } catch (e) {
                 console.error('Set scene error:', e);
-                lastScene = null;
+                lastScene = prevScene;
+                renderScene(lastSettings);
+                showToast(I18N.t('common.setFailed', { msg: I18N.t('common.unknownError') }));
             }
         }
 
@@ -1181,7 +1186,7 @@
             const merged = latestPorts[key];
             // 大读数 + 负载条 + V/A 行直接改文本，不重建卡片
             const pw = card.querySelector('.port-power-value');
-            if (pw) pw.textContent = merged.power.toFixed(1);
+            if (pw) pw.textContent = Number(merged.power ?? 0).toFixed(1);
             const charging = merged.power > 0;
             const fill = card.querySelector('.port-load-fill');
             if (fill) fill.style.width = loadPct(merged.power, Number(portId)) + '%';
@@ -1190,7 +1195,7 @@
             if (track) track.classList.toggle('is-idle', !charging);
             card.classList.toggle('is-charging', charging);
             const va = card.querySelector('.port-va');
-            if (va) va.textContent = `${merged.voltage.toFixed(1)}V · ${merged.current.toFixed(1)}A`;
+            if (va) va.textContent = `${Number(merged.voltage ?? 0).toFixed(1)}V · ${Number(merged.current ?? 0).toFixed(1)}A`;
             // 协议徽标文字 + 选中态
             const protoEl = card.querySelector('.port-protocol');
             if (protoEl) {
@@ -1336,7 +1341,10 @@
                 // BLE 命令端点离线时仍返回 HTTP 200，错误在 body 的 ok:false 里
                 const result = await res.json();
                 if (!result.ok) showToast(I18N.t('common.setFailed', { msg: result.error || I18N.t('common.unknownError') }));
-            } catch (e) { console.error('Set setting error:', e); }
+            } catch (e) {
+                console.error('Set setting error:', e);
+                showToast(I18N.t('common.setFailed', { msg: I18N.t('common.unknownError') }));
+            }
         }
 
         let countdownRendered = false;
@@ -1416,10 +1424,16 @@
                     }
                 } else {
                     // 命令未生效：不更新状态显示，等 SSE settings 事件回读真实值
-                    if (btn) { btn.disabled = false; btn.textContent = I18N.t('countdown.set'); }
+                    if (btn) { btn.disabled = false; btn.textContent = I18N.t('common.set'); }
                     showToast(I18N.t('common.setFailed', { msg: result.error || I18N.t('common.unknownError') }));
                 }
-            } catch (e) { console.error('Set countdown error:', e); countdownPending[port] = false; if (btn) { btn.disabled = false; } }
+            } catch (e) {
+                console.error('Set countdown error:', e);
+                countdownPending[port] = false;
+                // 网络异常同样要恢复按钮，否则会永远卡在"设置中..."
+                if (btn) { btn.disabled = false; btn.textContent = I18N.t('common.set'); }
+                showToast(I18N.t('common.setFailed', { msg: I18N.t('common.unknownError') }));
+            }
         }
 
         function setCountdownFromInput(port) {
@@ -1449,7 +1463,10 @@
                 const result = await res.json();
                 if (!result.ok) showToast(I18N.t('common.setFailed', { msg: result.error || I18N.t('common.unknownError') }));
                 // SSE status event will update UI when connection state changes
-            } catch (e) { console.error('BLE toggle error:', e); }
+            } catch (e) {
+                console.error('BLE toggle error:', e);
+                showToast(I18N.t('common.setFailed', { msg: I18N.t('common.unknownError') }));
+            }
             finally { btn.disabled = false; }
         }
 
@@ -1667,33 +1684,33 @@
             const lastPushText = ble.last_push_age != null ? I18N.t('quality.secondsAgo', { count: ble.last_push_age }) : I18N.t('quality.none');
             const pushColor = ble.last_push_age != null && ble.last_push_age > 10 ? 'color:var(--warning)' : '';
             const delayText = ble.next_reconnect_delay != null ? I18N.t('quality.secondsLater', { count: Math.round(ble.next_reconnect_delay) }) : null;
-            el.innerHTML = `<div style="font-weight:600;margin-bottom:2px;">BLE <span style="color:${scoreColor(ble.score)}">${ble.score}</span>/100</div>
+            el.innerHTML = `<div style="font-weight:600;margin-bottom:2px;">BLE <span style="color:${scoreColor(ble.score)}">${escapeHtml(ble.score)}</span>/100</div>
                 ${qualityBar(ble.score)}
                 <div class="quality-row"><span class="quality-label">${I18N.t('quality.connectionDuration')}</span><span>${uptimeText}</span></div>
                 <div class="quality-row"><span class="quality-label">${I18N.t('quality.lastPush')}</span><span style="${pushColor}">${lastPushText}</span></div>
                 ${delayText ? `<div class="quality-row"><span class="quality-label">${I18N.t('quality.nextReconnect')}</span><span style="color:var(--warning)">${delayText}</span></div>` : ''}
-                <div class="quality-row"><span class="quality-label">${I18N.t('quality.decryptSuccess')}</span><span>${ble.decrypt}%</span></div>
-                <div class="quality-row"><span class="quality-label">${I18N.t('quality.notifyResponse')}</span><span>${ble.notify}%</span></div>
-                <div class="quality-row"><span class="quality-label">${I18N.t('quality.connectionStable')}</span><span>${ble.reconnect_score}%</span></div>
+                <div class="quality-row"><span class="quality-label">${I18N.t('quality.decryptSuccess')}</span><span>${escapeHtml(ble.decrypt)}%</span></div>
+                <div class="quality-row"><span class="quality-label">${I18N.t('quality.notifyResponse')}</span><span>${escapeHtml(ble.notify)}%</span></div>
+                <div class="quality-row"><span class="quality-label">${I18N.t('quality.connectionStable')}</span><span>${escapeHtml(ble.reconnect_score)}%</span></div>
                 <div class="quality-row"><span class="quality-label">${I18N.t('quality.reconnect5m')}</span><span>${I18N.t('quality.times', { count: ble.reconnect_count_5m })}</span></div>`;
         }
         function renderMqttQuality(mqtt) {
             const el = document.getElementById('mqttTooltip');
             if (!el) return;
-            el.innerHTML = `<div style="font-weight:600;margin-bottom:2px;">MQTT <span style="color:${scoreColor(mqtt.score)}">${mqtt.score}</span>/100</div>
+            el.innerHTML = `<div style="font-weight:600;margin-bottom:2px;">MQTT <span style="color:${scoreColor(mqtt.score)}">${escapeHtml(mqtt.score)}</span>/100</div>
                 ${qualityBar(mqtt.score)}
                 <div class="quality-row"><span class="quality-label">${I18N.t('quality.runtime')}</span><span>${formatDuration(mqtt.uptime)}</span></div>
-                <div class="quality-row"><span class="quality-label">${I18N.t('quality.disconnects')}</span><span>${mqtt.disconnects}</span></div>
-                <div class="quality-row"><span class="quality-label">${I18N.t('quality.publishFailures')}</span><span>${mqtt.publish_failures}</span></div>`;
+                <div class="quality-row"><span class="quality-label">${I18N.t('quality.disconnects')}</span><span>${escapeHtml(mqtt.disconnects)}</span></div>
+                <div class="quality-row"><span class="quality-label">${I18N.t('quality.publishFailures')}</span><span>${escapeHtml(mqtt.publish_failures)}</span></div>`;
         }
         function renderBemfaQuality(bemfa) {
             const el = document.getElementById('bemfaTooltip');
             if (!el) return;
-            el.innerHTML = `<div style="font-weight:600;margin-bottom:2px;">Bemfa <span style="color:${scoreColor(bemfa.score)}">${bemfa.score}</span>/100</div>
+            el.innerHTML = `<div style="font-weight:600;margin-bottom:2px;">Bemfa <span style="color:${scoreColor(bemfa.score)}">${escapeHtml(bemfa.score)}</span>/100</div>
                 ${qualityBar(bemfa.score)}
                 <div class="quality-row"><span class="quality-label">${I18N.t('quality.runtime')}</span><span>${formatDuration(bemfa.uptime)}</span></div>
-                <div class="quality-row"><span class="quality-label">${I18N.t('quality.pingLost')}</span><span>${bemfa.ping_lost}/3</span></div>
-                <div class="quality-row"><span class="quality-label">${I18N.t('quality.reconnectCount')}</span><span>${bemfa.reconnect_count}</span></div>`;
+                <div class="quality-row"><span class="quality-label">${I18N.t('quality.pingLost')}</span><span>${escapeHtml(bemfa.ping_lost)}/3</span></div>
+                <div class="quality-row"><span class="quality-label">${I18N.t('quality.reconnectCount')}</span><span>${escapeHtml(bemfa.reconnect_count)}</span></div>`;
         }
         // Hover tooltip for each badge
         function setupBadgeTooltip(badgeId, tooltipId) {

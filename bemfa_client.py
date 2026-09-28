@@ -79,6 +79,11 @@ class BemfaClient:
         self._ping_publish_task: Optional[asyncio.Task] = None
         self._ping_receive_task: Optional[asyncio.Task] = None
         self._reconnect_count = 0
+        # 退避重连状态(见 _connect_mqtt / _schedule_reconnect / stop)
+        self._reconnect_attempt = 0  # 退避计数,连接成功后在 _on_connect 归零
+        self._stopped = False        # stop() 后禁止一切重连,防止僵尸 Timer
+        self._reconnect_timer: Optional[threading.Timer] = None  # 挂起的重连 Timer(单链)
+        self._connect_in_flight = False  # _connect_mqtt 并发建连防护
 
     @property
     def is_connected(self) -> bool:
@@ -123,10 +128,23 @@ class BemfaClient:
         # Start ping/pong keepalive (aligned with HA integration)
         self._ping_lost = 0
         self._start_ping_cycle()
-        _LOGGER.info("Bemfa client started")
+        if self._client is None:
+            # _connect_mqtt 失败路径会置 _client=None 并安排退避重试
+            _LOGGER.warning("Bemfa MQTT 首连失败,已安排退避重试")
+        else:
+            _LOGGER.info("Bemfa client started")
 
     async def stop(self):
         """Disconnect MQTT and cleanup."""
+        # 先置停止标志并取消挂起的重连 Timer,防止停止后僵尸重连。
+        # 置位与 _connect_mqtt 锁内复查共用 _lock,保证 happens-before。
+        with self._lock:
+            self._stopped = True
+            timer = self._reconnect_timer
+            self._reconnect_timer = None
+        if timer:
+            timer.cancel()
+
         # Cancel ping tasks
         for task in (self._ping_publish_task, self._ping_receive_task):
             if task:
@@ -160,60 +178,71 @@ class BemfaClient:
     # ---- MQTT ----
 
     def _connect_mqtt(self):
-        self._client = mqtt.Client(
-            mqtt.CallbackAPIVersion.VERSION2, self._uid, mqtt.MQTTv311
-        )
-        self._client.on_connect = self._on_connect
-        self._client.on_disconnect = self._on_disconnect
-        self._client.on_message = self._on_message
-
+        # 并发/停止防护:_stopped 或已有建连在进行中则直接返回,
+        # 防止多条重连链并发覆盖 _client(paho 网络线程与 socket 泄漏)。
+        if self._stopped or self._connect_in_flight:
+            return
+        with self._lock:
+            if self._stopped or self._connect_in_flight or self._client is not None:
+                return
+            self._connect_in_flight = True
         try:
-            self._client.connect(MQTT_HOST, MQTT_PORT, MQTT_KEEPALIVE)
-            self._client.loop_start()
-            _LOGGER.info("Bemfa MQTT connecting to %s:%s", MQTT_HOST, MQTT_PORT)
-        except Exception as e:
-            _LOGGER.error("Bemfa MQTT connection failed: %s", e)
+            self._client = mqtt.Client(
+                mqtt.CallbackAPIVersion.VERSION2, self._uid, mqtt.MQTTv311
+            )
+            self._client.on_connect = self._on_connect
+            self._client.on_disconnect = self._on_disconnect
+            self._client.on_message = self._on_message
+
             try:
-                self._client.loop_stop()
-            except Exception:
-                pass
-            self._client = None
-            # 首连失败必须留出重试通道：ping 循环的未连接分支只重排自身，
-            # 永远不会再调 _connect_mqtt——不安排重试的话，启动时网络抖动
-            # （DNS 未就绪等）会让语音控制静默失效到进程重启。
-            self._schedule_reconnect()
+                self._client.connect(MQTT_HOST, MQTT_PORT, MQTT_KEEPALIVE)
+                self._client.loop_start()
+                _LOGGER.info("Bemfa MQTT connecting to %s:%s", MQTT_HOST, MQTT_PORT)
+            except Exception as e:
+                _LOGGER.error("Bemfa MQTT connection failed: %s", e)
+                try:
+                    self._client.loop_stop()
+                except Exception:
+                    pass
+                self._client = None
+                # 首连失败必须留出重试通道：ping 循环的未连接分支只重排自身,
+                # 永远不会再调 _connect_mqtt——不安排重试的话，启动时网络抖动
+                # （DNS 未就绪等）会让语音控制静默失效到进程重启。
+                # in-flight 先清掉,否则重连 Timer 触发时会被入口守卫挡掉。
+                self._connect_in_flight = False
+                self._schedule_reconnect()
+        finally:
+            # 保守清防护位(覆盖 loop_start 成功但 on_connect 尚未回调的窗口);
+            # 与调度重连的重叠防护主要靠 _client is not None + 单链 Timer。
+            self._connect_in_flight = False
 
     _RECONNECT_DELAYS = (5, 15, 30, 60)  # 秒，封顶后按 60s 周期重试
 
     def _schedule_reconnect(self):
-        """线程安全地安排一次延迟重连（可从 executor 线程调用）。"""
-        def _delayed_reconnect():
+        """线程安全地安排一次延迟重连(可从 executor 线程调用)。
+
+        通过先取消旧 Timer 保证任意时刻只有一条重连链,
+        `_reconnect_attempt` 的读改写在锁内完成。
+        """
+        with self._lock:
+            if self._stopped:
+                return
+            # 取消旧的挂起 Timer,保证单条重连链,计数不被交错递增
+            if self._reconnect_timer is not None:
+                self._reconnect_timer.cancel()
+                self._reconnect_timer = None
             delay = self._RECONNECT_DELAYS[min(self._reconnect_attempt,
                                                len(self._RECONNECT_DELAYS) - 1)]
             self._reconnect_attempt += 1
             _LOGGER.warning("Bemfa MQTT retry #%d in %ds", self._reconnect_attempt, delay)
             timer = threading.Timer(delay, self._retry_connect)
             timer.daemon = True
-            timer.start()
-
-        self._reconnect_attempt = getattr(self, "_reconnect_attempt", 0)
-        _delayed_reconnect()
+            self._reconnect_timer = timer
+        timer.start()
 
     def _retry_connect(self):
-        """在 executor 里重试 MQTT 连接（成功后 attempt 归零在 _on_connect）。"""
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            # 无运行中事件循环（Timer 线程）：开新 loop 同步执行
-            asyncio.run(self._retry_connect_async())
-            return
-        asyncio.run_coroutine_threadsafe(self._retry_connect_async(), loop)
-
-    async def _retry_connect_async(self):
-        with self._lock:
-            if self._connected or self._client is not None:
-                return  # 已恢复，无需重试
-        await asyncio.get_running_loop().run_in_executor(None, self._connect_mqtt)
+        """Timer 线程内直接同步重试 MQTT 连接(成功后 attempt 归零在 _on_connect)。"""
+        self._connect_mqtt()
 
     def _disconnect_mqtt(self):
         if self._client:

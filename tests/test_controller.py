@@ -190,6 +190,151 @@ class TestAuthMultiframeCap:
         assert result == b"\xaa\xbb" * 100
 
 
+def _encrypted_frame(plaintext):
+    """把明文帧包成 cmd_recv 通知格式: [00 00 0x02 len] + payload。
+
+    _try_decode_inline 对 data[2]==0x02 的帧取 data[4:] 调 decrypt；
+    decrypt 在测试中 mock 为直接返回明文，payload 内容任意。
+    """
+    return bytes([0, 0, 0x02, len(plaintext)]) + plaintext
+
+
+def _result_frame(b4, siid, piid, err=0, value=bytes([0x2A]), vtype=1):
+    """构造 SET/GET Result 明文帧（对齐 controller 响应帧布局）。
+
+    布局: [tot_len][0x20][seq][0x00][b4][cnt=1][siid][piid][0x00]
+          [err_hi][err_lo][vlen][type][value...]  （对齐 GET Result 测试样例）
+    """
+    total = 13 + len(value)
+    return bytes([total, 0x20, 0x01, 0x00, b4, 0x01, siid, piid, 0x00,
+                  (err >> 8) & 0xFF, err & 0xFF, len(value), vtype]) + value
+
+
+def _ack_frame(siid, piid):
+    """构造 SET ACK 明文帧: [len][0x20][seq][0x00][0x01][cnt][siid][piid]。"""
+    return bytes([8, 0x20, 0x01, 0x00, 0x01, 0x01, siid, piid])
+
+
+class TestRecvSetResponse:
+    """_recv_set_response: SET ACK/Result 解析、错误码拒绝与 deadline。
+
+    手法: client/write_gatt_char 用 AsyncMock（_try_decode_inline 会写内联
+    ACK）、decrypt 直接返回明文帧、wait_notify 按脚本返回封装帧。
+    """
+
+    def _make_ctrl(self):
+        from unittest.mock import MagicMock, AsyncMock
+        from src.cuktech_ble.controller import CuktechBLEController
+        ctrl = CuktechBLEController(mac="AA:BB:CC:DD:EE:FF", token="aabbccddeeff")
+        ctrl.client = MagicMock()
+        ctrl.client.write_gatt_char = AsyncMock()
+        return ctrl
+
+    @pytest.mark.asyncio
+    async def test_result_nonzero_error_code_returns_none(self):
+        """Result 帧 pt[9]/pt[10] 非零 = 设备拒绝该 SET → 返回 None。
+
+        防止把未生效的残留 value 字节当成功缓存/上报。
+        """
+        from unittest.mock import MagicMock
+        ctrl = self._make_ctrl()
+        pt = _result_frame(0x04, 2, 5, err=0x0102, value=bytes([0x2A]))
+        assert pt[9] or pt[10]  # 帧构造自查：错误码确实非零
+        ctrl.decrypt = MagicMock(return_value=pt)
+
+        async def fake_wait_notify(name, timeout=None):
+            return _encrypted_frame(pt)
+
+        ctrl.wait_notify = fake_wait_notify
+        result = await ctrl._recv_set_response(2, 5)
+        assert result is None
+
+    @pytest.mark.asyncio
+    async def test_result_zero_error_parses_value(self):
+        """状态字节（pt[9]/pt[10]）全零 → 正常解析 value（uint8: pt[13]）。"""
+        from unittest.mock import MagicMock
+        ctrl = self._make_ctrl()
+        pt = _result_frame(0x04, 2, 5, err=0, value=bytes([0x2A]))
+        ctrl.decrypt = MagicMock(return_value=pt)
+
+        async def fake_wait_notify(name, timeout=None):
+            return _encrypted_frame(pt)
+
+        ctrl.wait_notify = fake_wait_notify
+        result = await ctrl._recv_set_response(2, 5)
+        assert result == {"piid": 5, "value": 0x2A, "raw": pt}
+
+    @pytest.mark.asyncio
+    async def test_ack_then_result_returns_value(self):
+        """先 ACK 后 Result（2.5s 窗口内到达）→ 正常返回 value。
+
+        同时验证 ACK 后 Result 等待 deadline 从 1.0s 放宽到 2.5s：
+        第二次 wait_notify 的 timeout ≈ 2.5（修复前为 1.0）。
+        """
+        from unittest.mock import MagicMock
+        ctrl = self._make_ctrl()
+        ack = _ack_frame(2, 5)
+        pt = _result_frame(0x04, 2, 5, err=0, value=bytes([0x01]))
+        ctrl.decrypt = MagicMock(side_effect=[ack, pt])
+
+        timeouts = []
+        seq = [ack, pt]
+
+        async def fake_wait_notify(name, timeout=None):
+            timeouts.append(timeout)
+            return _encrypted_frame(seq.pop(0))
+
+        ctrl.wait_notify = fake_wait_notify
+        result = await ctrl._recv_set_response(2, 5, timeout=8.0)
+
+        assert result == {"piid": 5, "value": 0x01, "raw": pt}
+        # 第一次等待受外层 8s deadline 限制 → timeout = min(≈8, 3) = 3.0
+        assert timeouts[0] == 3.0
+        # ACK 后 deadline 重置为 2.5s → 第二次等待 timeout ≈ 2.5
+        assert 2.0 <= timeouts[1] <= 2.55, \
+            f"ACK 后 Result 等待窗口应≈2.5s, got {timeouts[1]}"
+
+    @pytest.mark.asyncio
+    async def test_ack_only_returns_value_none(self):
+        """只收到 ACK、Result 始终不来 → 返回 {'value': None}。
+
+        controller 层 ACK-only 契约（ble_manager 侧据此报
+        "device acknowledged but did not confirm"）。
+        """
+        from unittest.mock import MagicMock
+        ctrl = self._make_ctrl()
+        ack = _ack_frame(2, 5)
+        ctrl.decrypt = MagicMock(return_value=ack)
+
+        seq = [_encrypted_frame(ack), None]
+
+        async def fake_wait_notify(name, timeout=None):
+            return seq.pop(0) if seq else None
+
+        ctrl.wait_notify = fake_wait_notify
+        result = await ctrl._recv_set_response(2, 5)
+        assert result == {"piid": 5, "value": None, "raw": None}
+
+    @pytest.mark.asyncio
+    async def test_no_response_returns_none(self):
+        """wait_notify 一直超时（None）→ 返回 None（非 dict）。
+
+        ble_manager 侧据此报 "no response from device"。用极短 timeout
+        避免真实 8s deadline 空转。
+        """
+        from unittest.mock import MagicMock
+        ctrl = self._make_ctrl()
+        ctrl.decrypt = MagicMock()  # 不应被调用
+
+        async def fake_wait_notify(name, timeout=None):
+            return None
+
+        ctrl.wait_notify = fake_wait_notify
+        result = await ctrl._recv_set_response(2, 5, timeout=0.05)
+        assert result is None
+        ctrl.decrypt.assert_not_called()
+
+
 class TestSendEncryptedClearQueue:
     """ble-warnings P2: _send_encrypted 写命令前清空 cmd_send 队列。
 

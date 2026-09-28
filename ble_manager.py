@@ -1317,6 +1317,13 @@ class BLEManager:
                 if cmd_future and not cmd_future.done():
                     cmd_future.set_result({"ok": False, "error": "no response from device"})
                 return
+            # ACK-only 响应（{'value': None, ...}）：设备确认收到但未回 Result
+            # （拒绝/超时），不能当成功写缓存，否则 UI 假成功而设备未生效。
+            if result.get("value") is None:
+                _LOGGER.warning("Set command piid=%s: ACK without Result, treating as failure", piid)
+                if cmd_future and not cmd_future.done():
+                    cmd_future.set_result({"ok": False, "error": "device acknowledged but did not confirm"})
+                return
             await self.state.update_settings({str(piid): value})
             # 同步协议扩展缓存，防止后续 toggle 读到过期值
             if piid == 21:
@@ -1350,7 +1357,14 @@ class BLEManager:
                 bit = PORT_BITS[port]
                 new_val = cur_val | (1 << bit) if action == "on" else cur_val & ~(1 << bit)
             if new_val != cur_val:
-                await self.ctrl.send_miot_command(2, 16, value=new_val)
+                write_result = await self.ctrl.send_miot_command(2, 16, value=new_val)
+                # SET 写入失败（发送失败/无响应 → None）时绝不能继续：否则
+                # 缓存被写成设备实际未生效的值，还误报 ok:true、误关会话。
+                if write_result is None:
+                    _LOGGER.warning("Port command %s %s: write not confirmed, rejecting", port, action)
+                    if cmd_future and not cmd_future.done():
+                        cmd_future.set_result({"ok": False, "error": "port write not confirmed"})
+                    return
                 await self.state.update_settings({"16": new_val})
                 # Emit port state for all changed ports (SSE + MQTT)
                 if port == "all":
@@ -1680,45 +1694,39 @@ class BLEManager:
             return
         frame_count = data[4] + 0x100 * data[5]
         if frame_count > 1000:
-            _LOGGER.warning("Multiframe count too large: %d, consuming all frames", frame_count)
-            await self.ctrl.client.write_gatt_char(
-                CHAR_CMD_RECV, bytes([0x00, 0x00, 0x01, 0x01]), response=False)
-            for i in range(frame_count):
-                try:
-                    frame = await asyncio.wait_for(
-                        self.ctrl.wait_notify("cmd_recv", timeout=3.0), timeout=5.0)
-                    if frame:
-                        await self._try_process_inline_frame(frame)
-                except ConnectionError:
-                    # Session is stale (consecutive decrypt failures) — let it
-                    # propagate so the caller reconnects instead of swallowing it.
-                    raise
-                except (asyncio.TimeoutError, Exception) as e:
-                    _LOGGER.warning("Multiframe drain stopped at frame %d/%d: %s", i+1, frame_count, e)
-                    break
-            await self.ctrl.client.write_gatt_char(
-                CHAR_CMD_RECV, bytes([0x00, 0x00, 0x01, 0x00]), response=False)
-            return
+            # 头损坏/失控的声称值：旧实现逐帧等满（N×3s，65535 帧 ≈ 54.6h）。
+            # 现在与正常分支共用同一套钳制 + deadline 排空逻辑，不再区别对待。
+            _LOGGER.warning(
+                "Multiframe count too large: %d (header claimed), clamping drain to 100 frames",
+                frame_count)
         await self.ctrl.client.write_gatt_char(
             CHAR_CMD_RECV, bytes([0x00, 0x00, 0x01, 0x01]), response=False)
         received_count = 0
         # 熔断：设备发多帧头后中途停止（链路劣化/头损坏）时，wait_notify
         # 超时返回 None 而非抛异常，若无 break 会把剩余帧数 × 3s 全部等满
-        # （1000 帧 ≈ 50 分钟），阻塞主循环内所有命令与探活。钳制帧数上限
-        # 并加整体 deadline，None 即终止。
+        # （100 帧 ≈ 5 分钟）。钳制帧数上限并加整体 deadline，None 即终止。
         deadline = asyncio.get_running_loop().time() + 30.0
-        for _ in range(min(frame_count, 100)):
-            if asyncio.get_running_loop().time() > deadline:
-                _LOGGER.warning("Multiframe deadline exceeded at frame %d/%d",
-                                received_count, frame_count)
-                break
-            frame = await self.ctrl.wait_notify("cmd_recv", timeout=3.0)
-            if not frame:
-                _LOGGER.warning("Multiframe stopped early: %d/%d frames",
-                                received_count, frame_count)
-                break
-            received_count += 1
-            await self._try_process_inline_frame(frame)
+        try:
+            for _ in range(min(frame_count, 100)):
+                if asyncio.get_running_loop().time() > deadline:
+                    _LOGGER.warning("Multiframe deadline exceeded at frame %d/%d",
+                                    received_count, frame_count)
+                    break
+                frame = await self.ctrl.wait_notify("cmd_recv", timeout=3.0)
+                if not frame:
+                    _LOGGER.warning(
+                        "Multiframe stopped early: received %d frames, header claimed %d",
+                        received_count, frame_count)
+                    break
+                received_count += 1
+                await self._try_process_inline_frame(frame)
+        except asyncio.TimeoutError:
+            # 防御：真实 wait_notify 超时返回 None 而非抛异常；此分支仅为
+            # 兼容旧测试 fake（或未来实现变化），同样立即终止排空。
+            _LOGGER.warning("Multiframe wait timed out after %d frames, header claimed %d",
+                            received_count, frame_count)
+        # ConnectionError（wait_notify 会话失效 / 解密连续失败判定 session
+        # stale）不在此吞掉——继续向上传播，由 _connect_and_run 正常重连。
         await self.ctrl.client.write_gatt_char(
             CHAR_CMD_RECV, bytes([0x00, 0x00, 0x01, 0x00]), response=False)
         if received_count != frame_count:

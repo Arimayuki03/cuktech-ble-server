@@ -2,6 +2,15 @@
 const API = window.location.origin;
 let _sessionChart = null;
 
+// XSS 转义工具：本文件被 phone.html 与 index.html 共同加载，而 escapeHtml 原本
+// 只在 app.js 定义（app.js 仅被 index.html 加载），phone 页上 `${(window.escapeHtml
+// || (v => v))(proto)}` 恒走恒等函数，转义失效。这里提供本模块自有的定义并挂到
+// window；index 页上 app.js 会重复赋值同实现，幂等无害。
+function escapeHtml(v) {
+    return String(v ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}
+window.escapeHtml = escapeHtml;
+
 // Format timestamp to local time string
 function fmtTime(ts) {
     if (!ts) return '--';
@@ -46,9 +55,14 @@ async function fetchSessions(port, period, limit, page) {
 
 let _dsTarget = 300;
 let _currentSessionId = null;
+// 详情请求乱序守卫：sessionId 比对只能拦"会话已切换"，同会话内切 downsample
+// 档位（或语言切换等重查）时 sessionId 不变，旧响应仍可能覆盖新渲染——
+// 用单调递增序号保证只有最新一次请求能落笔。
+let _dsSeq = 0;
 
 function setDownsample(target) {
-    _dsTarget = parseInt(target) || 0;    if (_currentSessionId) showSessionDetail(_currentSessionId);
+    _dsTarget = parseInt(target) || 0;
+    if (_currentSessionId) showSessionDetail(_currentSessionId);
 }
 
 // Fetch session detail points
@@ -65,17 +79,23 @@ async function fetchSessionPoints(sessionId) {
 function renderStats(containerId, stats) {
     const el = document.getElementById(containerId);
     if (!el) return;
+    // fetchEnergyStats 失败时返回带 error 的零值兜底对象：不能静默显示 0，
+    // 否则用户会把"请求失败"误读成"今天没充电"。
+    const errHtml = stats.error
+        ? `<div style="flex:0 0 100%;grid-column:1/-1;width:100%;text-align:center;color:var(--warning,#FFB300);font-size:11px;padding:2px 0;">${I18N.t('common.loadFailed')}</div>`
+        : '';
     const s = `color:var(--text)`;
     const l = `color:var(--text-dim)`;
-    el.innerHTML = `
+    el.innerHTML = `${errHtml}
         <div class="mini-stat"><div class="mini-stat-value" style="${s}">${stats.total_wh ? stats.total_wh.toFixed(1) : '0'}</div><div class="mini-stat-label" style="${l}">${I18N.t('charge.totalWh')}</div></div>
         <div class="mini-stat"><div class="mini-stat-value" style="${s}">${stats.session_count || 0}</div><div class="mini-stat-label" style="${l}">${I18N.t('charge.sessionCount')}</div></div>
         <div class="mini-stat"><div class="mini-stat-value" style="${s}">${stats.avg_power_w ? stats.avg_power_w.toFixed(1) : '0'}</div><div class="mini-stat-label" style="${l}">${I18N.t('charge.avgPower')}</div></div>
         <div class="mini-stat"><div class="mini-stat-value" style="${s}">${stats.peak_power_w ? stats.peak_power_w.toFixed(1) : '0'}</div><div class="mini-stat-label" style="${l}">${I18N.t('charge.peakPower')}</div></div>`;
 }
 
-// Render session list
-function renderSessionList(containerId, sessions, onClick) {
+// Render session list（fetchError: fetchSessions 失败时带的 error 字段，用于区分
+// "请求失败"和"真的没有记录"，避免失败被静默渲染成"暂无充电记录"）
+function renderSessionList(containerId, sessions, onClick, fetchError) {
     const el = document.getElementById(containerId);
     if (!el) return;
     // Filter out orphaned sessions: no end_time and not currently active,
@@ -87,7 +107,12 @@ function renderSessionList(containerId, sessions, onClick) {
         return true;
     });
     if (filtered.length === 0) {
-        el.innerHTML = `<div class="session-empty" style="text-align:center;color:var(--text-dim);padding:16px;font-size:13px;">${I18N.t('charge.noRecords')}</div>`;
+        // 请求本身失败（带 error 的兜底空列表）与"真的没有记录"是两回事：
+        // 前者要显式提示，不能让用户误读成"暂无充电记录"。
+        const emptyHtml = fetchError
+            ? `<div style="text-align:center;color:var(--warning,#FFB300);padding:16px;font-size:13px;">${I18N.t('common.loadFailed')}</div>`
+            : `<div class="session-empty" style="text-align:center;color:var(--text-dim);padding:16px;font-size:13px;">${I18N.t('charge.noRecords')}</div>`;
+        el.innerHTML = emptyHtml;
         return;
     }
     const portNames = {1:'C1', 2:'C2', 3:'C3', 4:'A'};
@@ -106,7 +131,7 @@ function renderSessionList(containerId, sessions, onClick) {
     }
     el.innerHTML = filtered.map(s => {
         const proto = s.protocol || '';
-        const protoHtml = proto ? `<span style="font-size:11px;color:var(--accent-ink);margin-left:6px;">${(window.escapeHtml || (v => v))(proto)}</span>` : '';
+        const protoHtml = proto ? `<span style="font-size:11px;color:var(--accent-ink);margin-left:6px;">${escapeHtml(proto)}</span>` : '';
         const isActive = s.is_active;
         const wh = (s.total_wh && s.total_wh > 0) ? s.total_wh.toFixed(1) : '0';
         const activeDot = isActive ? `<span style="display:inline-block;width:6px;height:6px;border-radius:50%;background:var(--dot-on,#34C759);margin-right:4px;animation:pulse 1.5s infinite;"></span>` : '';
@@ -133,10 +158,38 @@ function renderSessionList(containerId, sessions, onClick) {
 // Show session detail (chart + stats)
 async function showSessionDetail(sessionId) {
     _currentSessionId = sessionId;
+    const seq = ++_dsSeq;
     const data = await fetchSessionPoints(sessionId);
-    // 竞态守卫：快速连点会话 A、B 时，A 的慢响应后到会覆盖 B 的图表，
-    // 而导出按钮读的 _currentSessionId 是 B——显示与导出内容错位。
-    if (sessionId !== _currentSessionId) return;
+    // 竞态守卫：seq 拦同会话内切 downsample 的乱序旧响应，sessionId 拦"会话已切换"
+    // （快速连点 A、B 时 A 的慢响应后到会覆盖 B 的图表，而导出按钮读的
+    // _currentSessionId 是 B——显示与导出内容错位）。
+    if (seq !== _dsSeq || sessionId !== _currentSessionId) return;
+    if (data.error) {
+        // 失败路径不能静默：旧图表/旧数值继续挂着会误导（看起来像本次会话的数据），
+        // 且 seq 仍最新说明没有更新的请求在途，应当把错误显式画出来。
+        // 错误占位行由 JS 动态插入（两页 HTML 里都没有预留节点，且本模块不碰 HTML）。
+        console.warn('[charge_history] session points load failed:', data.error);
+        const detail = document.getElementById('sessionDetail');
+        if (detail) {
+            detail.style.display = 'block';
+            const canvas = document.getElementById('sessionChart');
+            let errEl = document.getElementById('sdError');
+            if (!errEl && canvas) {
+                errEl = document.createElement('div');
+                errEl.id = 'sdError';
+                errEl.style.cssText = 'display:none;text-align:center;color:var(--warning,#FFB300);font-size:12px;padding:4px 0;';
+                // 插在图表容器（canvas 的父节点）之前，两个页面的结构都适用
+                canvas.parentElement.parentNode.insertBefore(errEl, canvas.parentElement);
+            }
+            if (errEl) {
+                errEl.textContent = I18N.t('common.loadFailed');
+                errEl.style.display = 'block';
+            }
+            if (canvas) canvas.innerHTML = '';
+            if (_sessionChart) { _sessionChart.destroy(); _sessionChart = null; }
+        }
+        return;
+    }
     if (!data.points || data.points.length === 0) return;
 
     const points = data.points;
@@ -158,6 +211,9 @@ async function showSessionDetail(sessionId) {
     const detail = document.getElementById('sessionDetail');
     if (detail) {
         detail.style.display = 'block';
+        // 上一次失败留下的错误占位行：成功后要收起来
+        const prevErr = document.getElementById('sdError');
+        if (prevErr) prevErr.style.display = 'none';
         const el = (id) => document.getElementById(id);
         if (el('sdTitle')) el('sdTitle').textContent = `${fmtTime(points[0].timestamp)} → ${fmtTime(points[points.length-1].timestamp)}`;
         if (el('sdDuration')) el('sdDuration').textContent = fmtDuration(duration);
@@ -273,6 +329,9 @@ function renderSessionChart(points) {
 
 // Pagination state
 let _chPage = 1;
+// 列表/统计两个请求的乱序守卫序号（见 refreshChargeHistory 内注释）
+let _chStatsSeq = 0;
+let _chListSeq = 0;
 // 每页条数：默认 2（手机端）。桌面端在 startChargeHistoryAutoRefresh 的第 5 个参数里
 // 传更大的值（index 页传 4：卡片高度要和右栏配平，行数多了就得压缩别的卡）。
 //
@@ -331,7 +390,12 @@ function refreshChargeHistory(force) {
     const period = window._chPeriod;
     // 实际请求条数 = 目标总行数 - 活跃会话数（活跃会话会插队排在最前面）
     const limit = _chFetchLimit();
+    // 乱序守卫：快速切周期/翻页/连续轮询时，两个请求各自独立、到达顺序不保证，
+    // 旧响应后到会覆盖新渲染。各自用单调递增序号，比对不一致即丢弃。
+    const statsSeq = ++_chStatsSeq;
+    const listSeq = ++_chListSeq;
     fetchEnergyStats(period).then(stats => {
+        if (statsSeq !== _chStatsSeq) return;
         // 统计块同理：数字没变就不重画
         const sig = _chSignaturePrefix() + '|stats|' + JSON.stringify(stats);
         if (force || sig !== _chStatsSig) {
@@ -340,6 +404,7 @@ function refreshChargeHistory(force) {
         }
     });
     fetchSessions(null, period, limit, _chPage).then(data => {
+        if (listSeq !== _chListSeq) return;
         // 活跃会话数与上一轮不同（开始充电/充满/换口）：用修正后的条数再取一次，
         // 保证"列表总行数 = _chPageSize"恒成立，卡片高度因此不会跳
         const activeCount = (data.sessions || []).filter(x => x.is_active).length;
@@ -351,9 +416,11 @@ function refreshChargeHistory(force) {
         // 最后一页无数据时自动回退上一页
         if (data.sessions && data.sessions.length === 0 && data.page > 1) {
             _chPage = data.page - 1;
+            const retrySeq = ++_chListSeq;
             fetchSessions(null, period, _chFetchLimit(), _chPage).then(data2 => {
+                if (retrySeq !== _chListSeq) return;
                 _chSignature = '';
-                renderSessionList(containerId, data2.sessions);
+                renderSessionList(containerId, data2.sessions, null, data2.error);
                 renderPagination(containerId, data2);
             });
             return;
@@ -363,7 +430,7 @@ function refreshChargeHistory(force) {
         const sig = _chSignaturePrefix() + '|' + JSON.stringify(data.sessions || []);
         if (!force && sig === _chSignature) return;
         _chSignature = sig;
-        renderSessionList(containerId, data.sessions);
+        renderSessionList(containerId, data.sessions, null, data.error);
         renderPagination(containerId, data);
     });
 }

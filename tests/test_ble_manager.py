@@ -13,6 +13,7 @@ from ble_manager import BLEManager, set_status_cache_invalidator, _invalidate
 from ble_manager import (END_REASON_USER_OFF, END_REASON_UNPLUG, END_REASON_LOW_POWER,
                          END_REASON_LINK_LOSS, END_REASON_SHUTDOWN, END_REASON_UNKNOWN,
                          PORT_IDS)
+from cuktech_ble.controller import CHAR_CMD_RECV
 from state import ChargerState, PORT_NAMES, PORT_BITS, PORT_DEFAULT
 
 
@@ -159,7 +160,8 @@ class TestProcessCommands:
         """Test processing set command."""
         mgr = make_manager()
         mgr.ctrl = MagicMock()
-        mgr.ctrl.send_miot_command = AsyncMock(return_value={"ok": True})
+        # 真实 SET 成功契约: _recv_set_response 返回含 value 的 dict
+        mgr.ctrl.send_miot_command = AsyncMock(return_value={"piid": 5, "value": 1, "raw": bytes(14)})
 
         future = asyncio.get_running_loop().create_future()
         await mgr.cmd_queue.put(("set", (5, 1), future))
@@ -202,13 +204,60 @@ class TestProcessCommands:
         assert result["ok"] is False
         assert "BLE error" in result["error"]
 
+    @pytest.mark.asyncio
+    async def test_process_set_command_ack_only_rejected(self):
+        """SET 只收到 ACK 未收到 Result（value=None）→ 不得报成功/污染缓存。"""
+        mgr = make_manager()
+        mgr.ctrl = MagicMock()
+        # controller._recv_set_response 的 ACK-only 返回: truthy dict 但 value=None
+        mgr.ctrl.send_miot_command = AsyncMock(return_value={"piid": 5, "value": None, "raw": None})
+
+        future = asyncio.get_running_loop().create_future()
+        await mgr.cmd_queue.put(("set", (5, 1), future))
+
+        await mgr._process_commands()
+
+        assert future.done()
+        result = future.result()
+        assert result["ok"] is False
+        assert result["error"] == "device acknowledged but did not confirm"
+        # 缓存不得被假成功污染
+        assert mgr.state.settings.get("5") != 1
+
+    @pytest.mark.asyncio
+    async def test_process_port_command_write_unconfirmed(self):
+        """port SET 写入返回 None（未确认）→ 不更新缓存、不关会话、报 ok:False。"""
+        mgr = make_manager()
+        mgr.ctrl = MagicMock()
+
+        def send_miot_command(siid, piid, value=None):
+            if value is not None:
+                return None  # 写步骤未确认 → None
+            return {"value": 0x01}  # GET 正常
+        mgr.ctrl.send_miot_command = AsyncMock(side_effect=send_miot_command)
+        mgr._energy_states[1].is_charging = True
+        mgr._energy_states[1].session_wh = 5.0
+
+        future = asyncio.get_running_loop().create_future()
+        await mgr.cmd_queue.put(("port", ("c1", "off"), future))
+
+        await mgr._process_commands()
+
+        assert future.done()
+        result = future.result()
+        assert result["ok"] is False
+        assert result["error"] == "port write not confirmed"
+        # 副作用全部跳过：缓存未变、会话未闭合
+        assert mgr.state.settings.get("16") != 0x00
+        assert mgr._energy_states[1].is_charging is True
+
 
 class TestHandleMultiframe:
     """Test multi-frame data handling."""
 
     @pytest.mark.asyncio
     async def test_multiframe_large_count_sends_ack(self):
-        """Test multiframe with frame_count > 1000 sends ACK and consumes all frames."""
+        """Test multiframe with frame_count > 1000 clamps drain and stops on None."""
         mgr = make_manager()
         mgr.ctrl = MagicMock()
         mgr.ctrl.client = MagicMock()
@@ -221,7 +270,7 @@ class TestHandleMultiframe:
             nonlocal call_count
             call_count += 1
             if call_count > 5:
-                raise asyncio.TimeoutError()
+                return None  # 真实契约: wait_notify 超时返回 None 而非抛异常
             return bytes(20)
         mgr.ctrl.wait_notify = fake_wait_notify
 
@@ -229,8 +278,11 @@ class TestHandleMultiframe:
         data = bytes([0, 0, 0x00, 4, 0x03, 0xe9])
 
         await mgr._handle_multiframe(data)
+        # ACK + ACK done, 排空在第 6 次 wait_notify 返回 None 时提前终止
         assert mgr.ctrl.client.write_gatt_char.call_count == 2
         assert call_count == 6
+        # 5 个有效帧被内联处理
+        assert mgr._try_process_inline_frame.await_count == 5
 
 
 class TestHandleInlineData:
@@ -507,7 +559,7 @@ class TestMultiframeBoundary:
 
     @pytest.mark.asyncio
     async def test_multiframe_large_count(self):
-        """Test multiframe with frame_count=1001 drains frames."""
+        """Test multiframe with frame_count=1001 clamps drain and stops on None."""
         mgr = make_manager()
         mgr.ctrl = MagicMock()
         mgr.ctrl.client = MagicMock()
@@ -520,7 +572,7 @@ class TestMultiframeBoundary:
             nonlocal call_count
             call_count += 1
             if call_count > 5:
-                raise asyncio.TimeoutError()
+                return None  # 真实契约: wait_notify 超时返回 None 而非抛异常
             return bytes(20)
 
         mgr.ctrl.wait_notify = fake_wait_notify
@@ -530,9 +582,117 @@ class TestMultiframeBoundary:
 
         await mgr._handle_multiframe(data)
 
-        # ACK + drain loop hit 5 times before timeout + final ACK
+        # ACK + 排空第 6 次 wait_notify 返回 None 提前 break + final ACK
         assert mgr.ctrl.client.write_gatt_char.call_count == 2
         assert call_count == 6
+        assert mgr._try_process_inline_frame.await_count == 5
+
+    @pytest.mark.asyncio
+    async def test_multiframe_normal_count_stops_on_none(self):
+        """≤1000 分支：frame_count=50 且中途 wait_notify 返回 None → 提前 break。
+
+        验证熔断：不再把剩余帧数 × 3s 全部等满，两次 ACK（RCV_RDY/RCV_OK）
+        均写入，None 之前收到的帧已内联处理。
+        """
+        mgr = make_manager()
+        mgr.ctrl = MagicMock()
+        mgr.ctrl.client = MagicMock()
+        mgr.ctrl.client.write_gatt_char = AsyncMock()
+        mgr._try_process_inline_frame = AsyncMock()
+        call_count = 0
+
+        async def fake_wait_notify(name, timeout=5.0):
+            nonlocal call_count
+            call_count += 1
+            if call_count > 3:
+                return None  # 设备中途停止推送（头声称 50 帧）
+            return bytes(20)
+
+        mgr.ctrl.wait_notify = fake_wait_notify
+
+        # frame_count = 50（≤1000，走正常分支）
+        data = bytes([0, 0, 0x00, 4, 50, 0x00])
+
+        await mgr._handle_multiframe(data)
+
+        # 第 4 次 wait_notify 返回 None → 提前 break，不再等满 50 帧
+        assert call_count == 4
+        assert mgr._try_process_inline_frame.await_count == 3
+        # RCV_RDY + RCV_OK 两次 ACK 均写入
+        assert mgr.ctrl.client.write_gatt_char.call_count == 2
+        mgr.ctrl.client.write_gatt_char.assert_any_call(
+            CHAR_CMD_RECV, bytes([0x00, 0x00, 0x01, 0x01]), response=False)
+        mgr.ctrl.client.write_gatt_char.assert_any_call(
+            CHAR_CMD_RECV, bytes([0x00, 0x00, 0x01, 0x00]), response=False)
+
+    @pytest.mark.asyncio
+    async def test_multiframe_corrupt_header_all_none_no_54h_block(self):
+        """头声称 5000 帧(>1000)且 wait_notify 全返回 None → 首轮即 break。
+
+        回归:旧实现对损坏/失控的声称值逐帧等满(5000×3s ≈ 4.2h,
+        65535 帧 ≈ 54.6h),阻塞整个连接循环。修复后统一钳制到
+        min(frame_count, 100) 并加 30s deadline,wait_notify 返回 None
+        即终止——本用例中第一轮就 break,两次 ACK 照常写入,不抛异常。
+        """
+        mgr = make_manager()
+        mgr.ctrl = MagicMock()
+        mgr.ctrl.client = MagicMock()
+        mgr.ctrl.client.write_gatt_char = AsyncMock()
+        mgr._try_process_inline_frame = AsyncMock()
+        call_count = 0
+
+        async def fake_wait_notify(name, timeout=5.0):
+            nonlocal call_count
+            call_count += 1
+            return None  # 设备发完多帧头后一行数据都不推(链路劣化/头损坏)
+
+        mgr.ctrl.wait_notify = fake_wait_notify
+
+        # frame_count = 0x1388 = 5000 > 1000(损坏头声称值)
+        data = bytes([0, 0, 0x00, 4, 0x88, 0x13])
+
+        await mgr._handle_multiframe(data)  # 不抛异常即通过
+
+        # 钳制后上限 100 帧,但首轮 None 即 break → 只调用了 1 次
+        assert call_count == 1
+        # RCV_RDY + RCV_OK 两次 ACK 均写入
+        assert mgr.ctrl.client.write_gatt_char.call_count == 2
+        mgr.ctrl.client.write_gatt_char.assert_any_call(
+            CHAR_CMD_RECV, bytes([0x00, 0x00, 0x01, 0x01]), response=False)
+        mgr.ctrl.client.write_gatt_char.assert_any_call(
+            CHAR_CMD_RECV, bytes([0x00, 0x00, 0x01, 0x00]), response=False)
+        assert mgr._try_process_inline_frame.await_count == 0
+
+    @pytest.mark.asyncio
+    async def test_multiframe_connection_error_propagates(self):
+        """wait_notify 抛 ConnectionError(会话失效)→ 不吞掉,向上传播。
+
+        回归:排空循环不得把连接级错误当"设备停止推送"处理,否则
+        _connect_and_run 的正常重连路径永远不触发。RCV_RDY 已写入,
+        RCV_OK 收尾 ACK 因异常先于收尾传播而未写。
+        """
+        mgr = make_manager()
+        mgr.ctrl = MagicMock()
+        mgr.ctrl.client = MagicMock()
+        mgr.ctrl.client.write_gatt_char = AsyncMock()
+        mgr._try_process_inline_frame = AsyncMock()
+
+        async def fake_wait_notify(name, timeout=5.0):
+            raise ConnectionError("session stale")
+
+        mgr.ctrl.wait_notify = fake_wait_notify
+
+        # frame_count=3(正常分支),异常发生在第一个数据帧等待
+        data = bytes([0, 0, 0x00, 4, 3, 0x00])
+
+        with pytest.raises(ConnectionError):
+            await mgr._handle_multiframe(data)
+
+        # 仅 RCV_RDY 写入;RCV_OK 未写(异常跳过了收尾)
+        assert mgr.ctrl.client.write_gatt_char.call_count == 1
+        mgr.ctrl.client.write_gatt_char.assert_called_once_with(
+            CHAR_CMD_RECV, bytes([0x00, 0x00, 0x01, 0x01]), response=False)
+        assert mgr._try_process_inline_frame.await_count == 0
 
 
 class TestConcurrency:
@@ -543,7 +703,8 @@ class TestConcurrency:
         """Test multiple commands in queue are all processed."""
         mgr = make_manager()
         mgr.ctrl = MagicMock()
-        mgr.ctrl.send_miot_command = AsyncMock(return_value={"ok": True})
+        # 真实 SET 成功契约: _recv_set_response 返回含 value 的 dict
+        mgr.ctrl.send_miot_command = AsyncMock(return_value={"piid": 5, "value": 1, "raw": bytes(14)})
         publisher = MagicMock()
         mgr.set_mqtt_publisher(publisher)
 
@@ -1320,14 +1481,39 @@ class TestSessionActivePredicate:
 class TestChargeLimitArming:
     """会话起点重新武装 + always 可重复触发。"""
 
-    def test_session_start_rearms_fired_flag(self):
-        # 注意:这是纯占位(断言只验证 Python 赋值,不经过任何被测代码)。
-        # 真实的"会话起点重新武装"接线在 push 建会话路径的
-        # _close_resumed_orphan/_release_limit 流程中,需端到端驱动才有效。
+    @pytest.mark.asyncio
+    async def test_session_start_rearms_fired_flag(self):
+        """端到端（push 路径）：会话起点必须重新武装 fired，always 限额跨会话可复触发。
+
+        上一会话触发关断后 fired=True；新会话起点经 _try_process_inline_frame
+        的会话开始分支复位标志，随后能量达阈值时必须能再次入队关断——
+        证明重新武装真正生效，而非死标志。
+        """
         mgr = make_manager()
-        mgr._limit_fired[1] = True
-        mgr._limit_fired[1] = False   # 会话起点写入的那一行
-        assert mgr._limit_fired[1] is False
+        mgr.ctrl = MagicMock()
+        mgr.ctrl.client = MagicMock()
+        mgr.ctrl.client.write_gatt_char = AsyncMock()
+        mgr.ctrl.decrypt = MagicMock(return_value=bytes(
+            [0, 0, 0, 0, 0x04, 0, 0, 1, 0, 0x0a, 25, 201]))   # 20.1V 1.0A 活跃帧
+        mgr.set_mqtt_publisher(MagicMock())
+        mgr.set_charge_limits({"c1": {"wh": 0.01, "mode": "always"}})
+        mgr._limit_fired[1] = True   # 上一会话已触发关断
+
+        # 新会话起点：活跃推送帧 → 会话开始 → fired 经被测路径复位
+        frame = bytes([0, 0, 0x02, 4]) + bytes(
+            [0, 0, 0, 0, 0x04, 0, 0, 1, 0, 0x0a, 25, 201])
+        await mgr._handle_inline_data(frame)
+
+        assert mgr._energy_states[1].is_charging is True, "会话未开始"
+        assert mgr._limit_fired[1] is False, "会话起点未重新武装 fired"
+        assert mgr.cmd_queue.empty(), "起点帧能量为 0，不应触发关断"
+
+        # 重新武装后：能量达阈值可再次触发（always 模式跨会话持续有效）
+        mgr._energy_states[1].session_wh = 5.0
+        await mgr._handle_inline_data(frame)
+
+        assert mgr._limit_fired[1] is True, "重新武装后限额应可再次触发"
+        assert mgr.cmd_queue.get_nowait()[1] == ("c1", "off")
 
     def test_set_charge_limits_normalizes_and_returns_state(self):
         mgr = make_manager()

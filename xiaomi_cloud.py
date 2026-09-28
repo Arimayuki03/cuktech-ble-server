@@ -266,8 +266,12 @@ class QrCodeXiaomiCloudClient:
         self._qr_image_url = resp_data["qr"]
         self._login_url = resp_data["loginUrl"]
         self._long_polling_url = resp_data["lp"]
-        self._timeout = resp_data.get("timeout", 300)
-        _LOGGER.info("QR login: login_url=%s", self._login_url[:120] if self._login_url else "None")
+        try:
+            self._timeout = int(resp_data.get("timeout", 300))
+        except (TypeError, ValueError):
+            self._timeout = 300
+        # login_url 就是二维码内容本身（即登录凭据），绝不写入日志，只记存在性
+        _LOGGER.info("QR login: login_url received")
 
         # Download QR image
         qr_resp = self._session.get(self._qr_image_url, timeout=(5, 30))
@@ -293,7 +297,9 @@ class QrCodeXiaomiCloudClient:
     def _background_poll(self):
         """Long-poll in background thread, store result."""
         try:
-            _LOGGER.info("Background long-poll started on: %s", self._long_polling_url[:80])
+            # lp 轮询 URL 是本次扫码登录凭据的接收通道，能读日志者并发轮询同一
+            # URL 可能抢收凭据——绝不记录 URL 内容（含截断形式），只记启动事件
+            _LOGGER.info("Background long-poll started")
             start_time = time.time()
             while True:
                 try:
@@ -320,6 +326,13 @@ class QrCodeXiaomiCloudClient:
                     self._poll_done = True
                     return
                 else:
+                    # 401/403 属于致命响应（扫码已失效/被拒绝），重试无意义——
+                    # 立即终止，避免退避循环产生约 150 次请求 + 150 条 ERROR
+                    if response.status_code in (401, 403):
+                        self._poll_error = XiaomiCloudLoginError(
+                            "登录被拒绝 (HTTP %d)" % response.status_code)
+                        self._poll_done = True
+                        return
                     # 非 200 不能无限快速重试（重试风暴触发限流/封禁）：
                     # 退避 2s 并尊重总超时
                     _LOGGER.error("Background long-poll failed: %d", response.status_code)
@@ -351,7 +364,13 @@ class QrCodeXiaomiCloudClient:
         # Get serviceToken — location URL is one-time-use, only call once
         headers = {"User-Agent": self._agent, "Content-Type": "application/x-www-form-urlencoded"}
         _LOGGER.info("Following location URL (one-time)")
-        response = self._session.get(self._location, headers=headers, timeout=(5, 30))
+        try:
+            response = self._session.get(self._location, headers=headers, timeout=(5, 30))
+        except requests.exceptions.RequestException as e:
+            # location URL 一次性，请求失败后无法重放该凭据，只能重新扫码；
+            # 包装成登录错误避免以原始 requests 异常透传为 500
+            _LOGGER.error("Location request failed: %s", e)
+            raise XiaomiCloudLoginError("登录确认失败，请重新扫码") from e
         _LOGGER.info("Location response: status=%d", response.status_code)
         self._service_token = response.cookies.get("serviceToken")
         if not self._service_token:
@@ -417,12 +436,14 @@ class QrCodeXiaomiCloudClient:
         })
         # beaconkey 是长期 BLE 凭据，绝不能整体进日志（docker logs / 日志文件
         # 任何读者都可拿它直接对设备发起认证控制）——只记录 code 与是否存在
+        # result["result"] 可能是非 dict（服务端异常响应），先 isinstance 判断再取 beaconkey
+        _result = result.get("result") if isinstance(result, dict) else None
+        _result_dict = _result if isinstance(_result, dict) else {}
         _LOGGER.info("beaconkey: code=%s, key_found=%s",
                      result.get("code") if isinstance(result, dict) else "?",
-                     bool(isinstance(result, dict)
-                          and result.get("result", {}).get("beaconkey")))
-        if result and result.get("code") == 0:
-            key = result.get("result", {}).get("beaconkey", "")
+                     bool(_result_dict.get("beaconkey")))
+        if isinstance(result, dict) and result.get("code") == 0:
+            key = _result_dict.get("beaconkey", "")
             if key:
                 return key
         return None

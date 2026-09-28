@@ -6,6 +6,9 @@ const API_BASE = window.location.origin;
 // 放全局还有一个原因：页面的 bfcache 处理器要能关掉它并置空（见 initPhoneSSE）。
 let phoneEvtSource = null;
 
+// HTML 转义（文件本地实现，不依赖 window.escapeHtml 的加载顺序）
+function escHtml(v) { return String(v ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c])); }
+
 // Localized scene names/descriptions (keys into the i18n resource packs)
 function sceneName(mode) { return I18N.t('scene.' + ({ 1: 'ai', 2: 'eco', 3: 'single', 4: 'balanced' }[mode] || 'ai')); }
 function sceneDesc(mode) { return I18N.t('scene.desc' + ({ 1: 'Ai', 2: 'Eco', 3: 'Single', 4: 'Balanced' }[mode] || 'Ai')); }
@@ -324,7 +327,7 @@ function renderRateCard() {
             <span class="port-power-name">${name}</span>
             <span class="port-power-w">${status}</span>
             <span class="port-power-w-unit">W</span>
-            <span class="port-power-protocol">${protocol}</span>
+            <span class="port-power-protocol">${escHtml(protocol)}</span>
         </div>`;
     }
 }
@@ -809,8 +812,12 @@ function renderDelayOff() {
     for (const key of activeKeys) {
         const slider = document.getElementById(`delaySlider_${key}`);
         if (slider) {
+            // 拖动开始前的已提交值快照（null=尚未开始拖动），供 onchange 失败回滚
+            let delayPendingPrev = null;
             slider.oninput = function() {
                 const v = parseInt(this.value);
+                // 拖动手势的第一次 input 时快照已提交值，供 onchange 失败回滚（之后 input 只做预览）
+                if (delayPendingPrev === null) delayPendingPrev = delayMinutes[key] || 0;
                 delayMinutes[key] = v;
                 const valEl = document.getElementById('delayVal_' + key);
                 if (valEl) {
@@ -821,19 +828,43 @@ function renderDelayOff() {
             };
             slider.onchange = async function() {
                 const v = parseInt(this.value);
+                const prev = delayPendingPrev !== null ? delayPendingPrev : delayMinutes[key];
+                delayPendingPrev = null;
                 markLocalChange();
+                const rollback = () => {
+                    // 回滚到拖动前已提交的值，保持标签/滑块与设备一致
+                    delayMinutes[key] = prev;
+                    this.value = prev;
+                    const valEl = document.getElementById('delayVal_' + key);
+                    if (valEl) {
+                        valEl.textContent = prev > 0 ? I18N.t('common.minutes', { count: prev }) : I18N.t('common.notSet');
+                        valEl.style.color = prev > 0 ? PORT_COLORS[key] : 'var(--text-dim)';
+                    }
+                    this.style.background = `linear-gradient(to right,${PORT_COLORS[key]} ${prev/240*100}%,rgba(255,255,255,0.08) ${prev/240*100}%)`;
+                };
                 try {
                     // 契约:BLE 命令离线时仍返回 200,错误在 body 的 ok:false
                     const res = await fetch(`${API_BASE}/api/set`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ piid: DELAY_PIIDS[key], value: v }) });
                     const result = await res.json();
-                    if (!result.ok) toast(I18N.t('common.setFailed', { msg: result.error || I18N.t('common.unknownError') }));
-                } catch(e) {}
+                    if (!result.ok) {
+                        if (delayMinutes[key] === v) rollback();
+                        toast(I18N.t('common.setFailed', { msg: result.error || I18N.t('common.unknownError') }));
+                    }
+                } catch(e) {
+                    console.error(e);
+                    if (delayMinutes[key] === v) rollback();
+                    toast(I18N.t('common.setFailed', { msg: I18N.t('common.unknownError') }));
+                }
             };
         }
     }
 }
 
 // ── Actions ──
+// 防重入标记：飞行中忽略重复点击，避免相反命令交错（fix: toggle 防抖）
+const togglePending = {};
+let tricklePending = false;
+
 async function setScene(mode) {
     const prev = state.scene;
     state.scene = mode;
@@ -844,14 +875,20 @@ async function setScene(mode) {
         const res = await fetch(`${API_BASE}/api/set`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ piid: SCENE_PIID, value: mode }) });
         const result = await res.json();
         if (!result.ok) {
-            state.scene = prev;
-            renderAll();
+            // 仅当我们的乐观值仍是当前值才回滚，避免踩掉并发请求已设置的新值
+            if (state.scene === mode) { state.scene = prev; renderAll(); }
             toast(I18N.t('common.setFailed', { msg: result.error || I18N.t('common.unknownError') }));
         }
-    } catch(e) { console.error('setScene error:', e); state.scene = prev; renderAll(); }
+    } catch(e) {
+        console.error('setScene error:', e);
+        if (state.scene === mode) { state.scene = prev; renderAll(); }
+        toast(I18N.t('common.setFailed', { msg: I18N.t('common.unknownError') }));
+    }
 }
 
 async function togglePort(key) {
+    if (togglePending[key]) return; // 请求在途，忽略重复点击
+    togglePending[key] = true;
     const on = !state.ports[key].enabled;
     state.ports[key].enabled = on;
     markLocalChange();
@@ -861,18 +898,22 @@ async function togglePort(key) {
         const res = await fetch(`${API_BASE}/api/port`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ port: key, action: on ? 'on' : 'off' }) });
         const result = await res.json();
         if (!result.ok) {
-            state.ports[key].enabled = !on;
-            renderAll();
+            // 仅当开关仍是我们的乐观值才回滚，避免踩掉并发请求已设置的新值
+            if (state.ports[key].enabled === on) { state.ports[key].enabled = !on; renderAll(); }
             toast(I18N.t('common.setFailed', { msg: result.error || I18N.t('common.unknownError') }));
         }
     } catch(e) {
         console.error(e);
-        state.ports[key].enabled = !on;
-        renderAll();
+        if (state.ports[key].enabled === on) { state.ports[key].enabled = !on; renderAll(); }
+        toast(I18N.t('common.setFailed', { msg: I18N.t('common.unknownError') }));
+    } finally {
+        delete togglePending[key];
     }
 }
 
 async function toggleTrickle() {
+    if (tricklePending) return; // 请求在途，忽略重复点击
+    tricklePending = true;
     const prev = state.trickleEnabled;
     state.trickleEnabled = !state.trickleEnabled;
     markLocalChange();
@@ -880,24 +921,45 @@ async function toggleTrickle() {
         const res = await fetch(`${API_BASE}/api/set`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ piid: 15, value: state.trickleEnabled ? 1 : 0 }) });
         const result = await res.json();
         if (!result.ok) {
-            state.trickleEnabled = prev;
-            renderAll();
+            // 仅当仍是我们的乐观值才回滚，避免踩掉并发请求已设置的新值
+            if (state.trickleEnabled !== prev) { state.trickleEnabled = prev; renderAll(); }
             toast(I18N.t('common.setFailed', { msg: result.error || I18N.t('common.unknownError') }));
         }
-    } catch(e) { state.trickleEnabled = prev; renderAll(); }
+    } catch(e) {
+        console.error(e);
+        if (state.trickleEnabled !== prev) { state.trickleEnabled = prev; renderAll(); }
+        toast(I18N.t('common.setFailed', { msg: I18N.t('common.unknownError') }));
+    } finally {
+        tricklePending = false;
+    }
 }
 
 async function cycleScreenTime() {
+    // 失败回滚快照：SSE 只在 set 成功时广播，失败不回滚会导致 UI 与设备不一致
+    const prev = state.screenTime;
     // 有效原始值 1-5（1=5分钟,2=10分钟,3=30分钟,4=常亮,5=1分钟），跳过占位的 index 0
-    state.screenTime = ((state.screenTime - 1) % 5 + 6) % 5 + 1;
+    const next = ((state.screenTime - 1) % 5 + 6) % 5 + 1;
+    state.screenTime = next;
     document.getElementById('screenTimeVal').innerHTML =
         screenTimeLabel(state.screenTime) + ' <img src="static/plugin_imgs/main_charger_dark_icon_more.png" alt="">';
     markLocalChange();
+    const renderScreenTimeVal = () => {
+        document.getElementById('screenTimeVal').innerHTML =
+            screenTimeLabel(state.screenTime) + ' <img src="static/plugin_imgs/main_charger_dark_icon_more.png" alt="">';
+    };
     try {
         const res = await fetch(`${API_BASE}/api/set`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ piid: 6, value: state.screenTime }) });
         const result = await res.json();
-        if (!result.ok) toast(I18N.t('common.setFailed', { msg: result.error || I18N.t('common.unknownError') }));
-    } catch(e) {}
+        if (!result.ok) {
+            // 仅当我们的乐观值仍是当前值才回滚，避免踩掉并发请求已设置的新值
+            if (state.screenTime === next) { state.screenTime = prev; renderScreenTimeVal(); }
+            toast(I18N.t('common.setFailed', { msg: result.error || I18N.t('common.unknownError') }));
+        }
+    } catch(e) {
+        console.error(e);
+        if (state.screenTime === next) { state.screenTime = prev; renderScreenTimeVal(); }
+        toast(I18N.t('common.setFailed', { msg: I18N.t('common.unknownError') }));
+    }
 }
 
 // ── Top-view fade on scroll ──

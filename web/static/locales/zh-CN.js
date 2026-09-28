@@ -27,6 +27,7 @@
             disconnected: '未连接',
             unknownError: '未知错误',
             networkError: '网络错误: {{msg}}',
+            loadFailed: '加载失败',
             saveFailed: '保存失败: {{msg}}',
             setFailed: '设置失败: {{msg}}',
             firmware: '固件版本：{{version}}',

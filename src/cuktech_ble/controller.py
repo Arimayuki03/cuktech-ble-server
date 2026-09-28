@@ -913,12 +913,21 @@ class CuktechBLEController:
 
             if b4 == 0x01 and pt_siid == (siid & 0xFF) and pt_piid == (piid & 0xFF):
                 got_ack = True
-                deadline = asyncio.get_running_loop().time() + 1.0
+                # ACK 后给 Result 留足时间（设备偶尔 >1s 才回 Result），
+                # 减少只收到 ACK 就按 "ACK-only" 空结果返回的频率
+                deadline = asyncio.get_running_loop().time() + 2.5
                 continue
             elif b4 == 0x04 and pt_siid == (siid & 0xFF) and pt_piid == (piid & 0xFF):
                 val = None
                 # Result 帧布局: [.., pt9=err_hi, pt10=err_lo, pt11=len, pt12=type,
                 #                 pt13..=value] — 与 GET Result 同构
+                # pt[9:11] 为错误码（非零 = 设备拒绝该 SET，value 区为残留字节、
+                # 无意义），与 _recv_get_response 语义一致：返回 None 交由调用方
+                # 按失败处理，避免把未生效值当成功缓存/上报
+                if len(pt) > 10 and (pt[9] or pt[10]):
+                    _LOGGER.warning("SET rejected by device: piid=%s status=0x%02x%02x",
+                                    piid, pt[9], pt[10])
+                    return None
                 if len(pt) >= 14:
                     vlen = pt[11] if len(pt) > 11 else 1
                     if vlen >= 4 and len(pt) >= 17:

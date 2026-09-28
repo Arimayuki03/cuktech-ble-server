@@ -27,6 +27,7 @@
             disconnected: 'Not connected',
             unknownError: 'Unknown error',
             networkError: 'Network error: {{msg}}',
+            loadFailed: 'Load failed',
             saveFailed: 'Save failed: {{msg}}',
             setFailed: 'Failed to set: {{msg}}',
             firmware: 'Firmware: {{version}}',

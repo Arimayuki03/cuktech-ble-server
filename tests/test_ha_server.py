@@ -171,8 +171,11 @@ class TestHandleLogLevel:
 
     @pytest.mark.asyncio
     async def test_set_log_level(self, tmp_path, monkeypatch):
+        import yaml
+
         from ha_server import Server
-        monkeypatch.setenv("CUKTECH_CONFIG_PATH", str(tmp_path / "config.yaml"))
+        config_path = tmp_path / "config.yaml"
+        monkeypatch.setenv("CUKTECH_CONFIG_PATH", str(config_path))
         s = Server.__new__(Server)
 
         request = AsyncMock()
@@ -182,6 +185,13 @@ class TestHandleLogLevel:
         result = await s.handle_log_level(request)
         body = json.loads(result.body)
         assert body["ok"] is True
+
+        # 持久化失败在实现中被 except Exception 吞掉只记 warning,
+        # 响应仍返回 ok=True,故必须验证 config.yaml 真的写入了 level。
+        assert config_path.exists(), "POST /api/log-level 应持久化到 CUKTECH_CONFIG_PATH 指向的 config.yaml"
+        with open(config_path) as f:
+            persisted = yaml.safe_load(f)
+        assert persisted["server"]["log_level"] == "debug"
 
     @pytest.mark.asyncio
     async def test_set_invalid_log_level(self, tmp_path, monkeypatch):
