@@ -6,6 +6,7 @@ import asyncio
 import re
 import sys
 import warnings
+from typing import Any  # noqa: F401 — 131 行注解使用;函数内注解运行时不求值,但 get_type_hints/文档工具会
 warnings.filterwarnings('ignore', message='.*default MTU.*')
 import gzip
 import hashlib
@@ -885,7 +886,10 @@ class Server:
             port = int(request.match_info.get("port", 1))
         except ValueError:
             return web.json_response({"ok": False, "error": "invalid port"}, status=400)
-        hours = min(float(request.query.get("hours", 24)), 720)
+        try:
+            hours = min(float(request.query.get("hours", 24)), 720)
+        except (TypeError, ValueError):
+            return web.json_response({"ok": False, "error": "hours must be a number"}, status=400)
 
         if port not in range(1, 5):
             return web.json_response({"ok": False, "error": "invalid port"}, status=400)
@@ -899,7 +903,10 @@ class Server:
             port = int(request.match_info.get("port", 1))
         except ValueError:
             return web.json_response({"ok": False, "error": "invalid port"}, status=400)
-        hours = min(float(request.query.get("hours", 24)), 720)
+        try:
+            hours = min(float(request.query.get("hours", 24)), 720)
+        except (TypeError, ValueError):
+            return web.json_response({"ok": False, "error": "hours must be a number"}, status=400)
 
         if port not in range(1, 5):
             return web.json_response({"ok": False, "error": "invalid port"}, status=400)
@@ -943,8 +950,12 @@ class Server:
         """GET /api/sessions?port=c1&period=today&limit=10&page=1"""
         port_str = request.query.get("port", "")
         period = request.query.get("period", "today")
-        limit = min(int(request.query.get("limit", "10")), 50)
-        page = max(1, int(request.query.get("page", "1")))
+        try:
+            # limit 下限 1:负数/0 会让 SQLite LIMIT 语义变"无限制"返回全表
+            limit = max(1, min(int(request.query.get("limit", "10")), 50))
+            page = max(1, int(request.query.get("page", "1")))
+        except (TypeError, ValueError):
+            return json_response({"ok": False, "error": "limit/page must be integers"}, status=400)
 
         port = None
         if port_str:
@@ -1015,8 +1026,11 @@ class Server:
 
     async def handle_session_points(self, request):
         """GET /api/sessions/{id}/points?downsample=600"""
-        sid = int(request.match_info["id"])
-        target = int(request.query.get("downsample", "0"))
+        try:
+            sid = int(request.match_info["id"])
+            target = int(request.query.get("downsample", "0"))
+        except (TypeError, ValueError):
+            return json_response({"ok": False, "error": "session id / downsample must be integers"}, status=400)
         loop = asyncio.get_running_loop()
         points = await loop.run_in_executor(
             None, self.history.get_session_points, sid)
@@ -1307,7 +1321,11 @@ class Server:
             except Exception:
                 pass
         s.history.close()
-        # Re-exec: replace current process with fresh server
+        # Re-exec: replace current process with fresh server.
+        # Nuitka standalone 下 sys.executable 是编译产物自身，
+        # 传 ha_server.py 参数会失败；直接重跑 exe（数据文件在同级目录）。
+        if hasattr(sys, "__compiled__"):  # noqa: F821 — Nuitka 官方标记
+            os.execv(sys.executable, [sys.executable])
         os.execv(sys.executable, [sys.executable, str(Path(__file__).parent / "ha_server.py")])
 
     # ── Xiaomi Cloud API ──
