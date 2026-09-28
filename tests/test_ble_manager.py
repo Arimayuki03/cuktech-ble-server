@@ -382,6 +382,8 @@ class TestReconnectLoop:
         async def fake_wait_for(coro, timeout):
             nonlocal wait_calls
             wait_calls += 1
+            # 消费掉传入协程,避免 "coroutine was never awaited" 告警
+            coro.close()
             if wait_calls >= 2:
                 mgr._stop_event.set()
             raise asyncio.TimeoutError()
@@ -470,6 +472,8 @@ class TestAuthFailureRetry:
         async def fake_wait_for(coro, timeout):
             nonlocal wait_calls
             wait_calls += 1
+            # 消费掉传入协程,避免 "coroutine was never awaited" 告警
+            coro.close()
             if wait_calls >= 2:
                 mgr._stop_event.set()
             raise asyncio.TimeoutError()
@@ -1317,6 +1321,9 @@ class TestChargeLimitArming:
     """会话起点重新武装 + always 可重复触发。"""
 
     def test_session_start_rearms_fired_flag(self):
+        # 注意:这是纯占位(断言只验证 Python 赋值,不经过任何被测代码)。
+        # 真实的"会话起点重新武装"接线在 push 建会话路径的
+        # _close_resumed_orphan/_release_limit 流程中,需端到端驱动才有效。
         mgr = make_manager()
         mgr._limit_fired[1] = True
         mgr._limit_fired[1] = False   # 会话起点写入的那一行

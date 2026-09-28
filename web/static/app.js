@@ -144,7 +144,8 @@
             const desc = document.getElementById('sceneDesc');
             if (desc) desc.textContent = I18N.t(active.descKey);
             // 场景名同时出现在设备图上方那枚徽标里，跟着一起换
-            updateSceneBadge(document.getElementById('sceneBadgeAni').classList.contains('show'));
+            const badgeAni = document.getElementById('sceneBadgeAni');
+            if (badgeAni) updateSceneBadge(badgeAni.classList.contains('show'));
         }
 
         // 换肤要让图标在 {dark|light} 两套里切换
@@ -155,13 +156,20 @@
             lastScene = mode;
             renderScene(lastSettings);
             try {
-                await fetch(`${API_BASE}/api/set`, {
+                const res = await fetch(`${API_BASE}/api/set`, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify({ piid: SCENE_PIID, value: mode })
                 });
+                // 失败时回滚乐观更新，等下一次 settings 事件恢复真实状态
+                const result = await res.json();
+                if (!result.ok) {
+                    lastScene = null;
+                    showToast(I18N.t('common.setFailed', { msg: result.error || I18N.t('common.unknownError') }));
+                }
             } catch (e) {
                 console.error('Set scene error:', e);
+                lastScene = null;
             }
         }
 
@@ -322,6 +330,7 @@
             }
             if (modeEl) modeEl.dataset.touched = '1';
             const res = await ChargeLimit.saveLimit(port, wh, modeEl ? modeEl.value : null);
+            if (res.pending) return;  // 上一请求仍在进行，静默跳过（非失败）
             if (res.ok) {
                 if (modeEl) modeEl.dataset.touched = '';
                 showToast(wh > 0 ? I18N.t('chargeLimit.saved') : I18N.t('chargeLimit.cleared'));
@@ -334,6 +343,7 @@
 
         async function clearChargeLimit(port) {
             const res = await ChargeLimit.saveLimit(port, 0, null);
+            if (res.pending) return;  // 上一请求仍在进行，静默跳过
             if (res.ok) {
                 const modeEl = document.getElementById(`limit-mode-${port}`);
                 if (modeEl) modeEl.dataset.touched = '';
@@ -617,23 +627,28 @@
             ).join('');
         }
         let _chartDataLoaded = false;
+        let _chartSeq = 0;
         async function fetchChartData() {
+            const seq = ++_chartSeq;
             try {
                 const interval = getInterval();
                 const url = `${API_BASE}/api/chart?hours=${getCurrentHours()}&interval=${interval}`;
                 const res = await fetch(url);
+                // 竞态守卫：切时间档/30s 定时器会并发触发本函数，
+                // 慢的旧响应（hours 参数已过期）不能覆盖新数据
+                if (seq !== _chartSeq) return;
                 if (res.status === 304) {
                     if (!_chartDataLoaded) {
                         // Force fetch on first load (bypass cache)
                         const r2 = await fetch(url + '&_=' + Date.now());
-                        if (r2.ok) { const j2 = await r2.json(); if (j2.ok) updateChart(j2); }
+                        if (seq === _chartSeq && r2.ok) { const j2 = await r2.json(); if (j2.ok) updateChart(j2); }
                         _chartDataLoaded = true;
                     }
                     return;
                 }
                 if (!res.ok) return;
                 const result = await res.json();
-                if (result.ok) { updateChart(result); _chartDataLoaded = true; }
+                if (seq === _chartSeq && result.ok) { updateChart(result); _chartDataLoaded = true; }
             } catch (e) {
                 console.error('Failed to fetch chart data:', e);
             }
@@ -749,7 +764,7 @@
             const cls = wh > 0 ? 'energy-row' : 'energy-row is-zero';
             const pct = Math.round(share * 100);
             return `<div class="${cls}">
-                <span class="energy-name"><i class="energy-dot" style="background:${color}"></i>${label}${live}</span>
+                <span class="energy-name"><i class="energy-dot" style="background:${color}"></i>${escapeHtml(label)}${live}</span>
                 <span class="energy-track"><i class="energy-fill" style="width:${pct}%;background:${color}"></i></span>
                 <span class="energy-val">${wh.toFixed(1)}<i>Wh</i></span>
                 <span class="energy-count">${I18N.t('energy.count', { count: count || 0 })}</span>
@@ -921,6 +936,15 @@
             }
         }
 
+        // ── XSS 纵深防御：服务端字段进 innerHTML 的内插点统一转义 ──
+        // 当前值域都是固定词表/数值，但后端字段日后变成自由文本（错误消息、备注）时
+        // 不至于成为注入面。新增 innerHTML 内插点一律过本函数。
+        function escapeHtml(v) {
+            return String(v ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+        }
+        // charge_history.js 等同页脚本没有公共工具层，挂 window 共享
+        window.escapeHtml = escapeHtml;
+
         function _updateRealTimeModalChart() {
             if (!currentModalPort || !modalChart || modalRealTimePort === null) return;
             const buf = realTimeBuf[currentModalPort];
@@ -928,9 +952,11 @@
             // ── 更新弹窗顶部的瞬时值 ──
             const rt = latestPorts[currentModalPort];
             if (rt) {
-                document.getElementById('modalVoltage').textContent = rt.voltage.toFixed(1);
-                document.getElementById('modalCurrent').textContent = rt.current.toFixed(2);
-                document.getElementById('modalPower').textContent = rt.power.toFixed(1);
+                // 字段兜底：port_update 可能是部分字段（updatePortDOM 就按部分合并写），
+                // undefined.toFixed 会让这个 2s 更新链路直接抛错停摆
+                document.getElementById('modalVoltage').textContent = Number(rt.voltage ?? 0).toFixed(1);
+                document.getElementById('modalCurrent').textContent = Number(rt.current ?? 0).toFixed(2);
+                document.getElementById('modalPower').textContent = Number(rt.power ?? 0).toFixed(1);
                 const protocolEl = document.getElementById('modalProtocol');
                 if (protocolEl) {
                     protocolEl.textContent = rt.protocol || 'idle';
@@ -1011,7 +1037,7 @@
                 if ((portKey === 'c1' || portKey === 'c2') && pk === 'pps' && !sw.pd) continue;
                 const on = sw[pk];
                 const cls = on ? 'proto-btn on' : 'proto-btn';
-                html += `<button class="${cls}" data-port="${portKey}" data-proto="${pk}" onclick="toggleProtocol(this)">${labels[pk] || pk}</button>`;
+                html += `<button class="${cls}" data-port="${portKey}" data-proto="${escapeHtml(pk)}" onclick="toggleProtocol(this)">${escapeHtml(labels[pk] || pk)}</button>`;
             }
             html += '</div>';
             if (portKey === 'c1' || portKey === 'c2') {
@@ -1247,7 +1273,7 @@
                         <div class="port-load${pct ? '' : ' is-idle'}" title="${basis}"><div class="port-load-fill" data-port="${id}" style="width:${pct}%"></div></div>
                         <div class="port-sub">
                             <span class="port-va">${port.voltage.toFixed(1)}V · ${port.current.toFixed(1)}A</span>
-                            <span class="port-protocol">${port.protocol}</span>
+                            <span class="port-protocol">${escapeHtml(port.protocol)}</span>
                         </div>
                     </div>`;
             }
@@ -1305,7 +1331,12 @@
 
         async function setSetting(piid, value) {
             markLocal();
-            try { await fetch(`${API_BASE}/api/set`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ piid, value }) }); } catch (e) { console.error('Set setting error:', e); }
+            try {
+                const res = await fetch(`${API_BASE}/api/set`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ piid, value }) });
+                // BLE 命令端点离线时仍返回 HTTP 200，错误在 body 的 ok:false 里
+                const result = await res.json();
+                if (!result.ok) showToast(I18N.t('common.setFailed', { msg: result.error || I18N.t('common.unknownError') }));
+            } catch (e) { console.error('Set setting error:', e); }
         }
 
         let countdownRendered = false;
@@ -1372,14 +1403,21 @@
             const piid = COUNTDOWN_PIIDS[id];
             if (!piid) { countdownPending[port] = false; if (btn) { btn.disabled = false; } return; }
             try {
-                await fetch(`${API_BASE}/api/set`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ piid, value: minutes }) });
-                // Immediately update button + status based on result
+                const res = await fetch(`${API_BASE}/api/set`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ piid, value: minutes }) });
+                const result = await res.json();
                 countdownPending[port] = false;
-                if (statusEl) statusEl.textContent = minutes > 0 ? I18N.t('common.minutes', { count: minutes }) : I18N.t('common.notSet');
-                if (btn) {
-                    btn.disabled = false;
-                    btn.textContent = minutes > 0 ? I18N.t('common.clear') : I18N.t('common.set');
-                    btn.className = `countdown-toggle-btn ${minutes > 0 ? 'clear' : 'set'}`;
+                if (result.ok) {
+                    // Immediately update button + status based on result
+                    if (statusEl) statusEl.textContent = minutes > 0 ? I18N.t('common.minutes', { count: minutes }) : I18N.t('common.notSet');
+                    if (btn) {
+                        btn.disabled = false;
+                        btn.textContent = minutes > 0 ? I18N.t('common.clear') : I18N.t('common.set');
+                        btn.className = `countdown-toggle-btn ${minutes > 0 ? 'clear' : 'set'}`;
+                    }
+                } else {
+                    // 命令未生效：不更新状态显示，等 SSE settings 事件回读真实值
+                    if (btn) { btn.disabled = false; btn.textContent = I18N.t('countdown.set'); }
+                    showToast(I18N.t('common.setFailed', { msg: result.error || I18N.t('common.unknownError') }));
                 }
             } catch (e) { console.error('Set countdown error:', e); countdownPending[port] = false; if (btn) { btn.disabled = false; } }
         }
@@ -1407,7 +1445,9 @@
             btn.disabled = true;
             try {
                 const enable = btn.dataset.state === 'connect';
-                await fetch(`${API_BASE}/api/enable`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ enabled: enable }) });
+                const res = await fetch(`${API_BASE}/api/enable`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ enabled: enable }) });
+                const result = await res.json();
+                if (!result.ok) showToast(I18N.t('common.setFailed', { msg: result.error || I18N.t('common.unknownError') }));
                 // SSE status event will update UI when connection state changes
             } catch (e) { console.error('BLE toggle error:', e); }
             finally { btn.disabled = false; }
@@ -1490,6 +1530,7 @@
         // ── SSE (Server-Sent Events) — replaces 2s polling ──
         let evtSource = null;
         let sseChartTimer = null;
+        let _sseLifecycleWired = false;
 
         // Fallback polling — used when SSE init fails
         async function pollStatus() {
@@ -1572,13 +1613,29 @@
                 } catch (err) { console.error('SSE parse error:', err); }
             };
             evtSource.onerror = () => {
-                console.warn('SSE disconnected, will auto-reconnect');
-                document.getElementById('statusBadge').className = 'status-badge disconnected';
+                // 服务端 /api/events 有 120s 硬超时，超时返回 504（非 200）——
+                // 按 SSE 规范浏览器会 fail the connection（readyState → CLOSED），
+                // 内建自动重连只对网络层中断生效，对收到的 504 响应无效，
+                // 必须在这里手动重连，否则实时数据在 2 分钟后静默冻结。
+                if (evtSource && evtSource.readyState === EventSource.CLOSED) {
+                    evtSource = null;
+                    document.getElementById('statusBadge').className = 'status-badge disconnected';
+                    setTimeout(initSSE, 3000);
+                } else {
+                    console.warn('SSE disconnected, will auto-reconnect');
+                    document.getElementById('statusBadge').className = 'status-badge disconnected';
+                }
             };
             // bfcache: close on leave, reopen on return
-            window.addEventListener('pagehide', () => { if (evtSource) { evtSource.close(); evtSource = null; } });
-            window.addEventListener('pageshow', () => { if (!evtSource) initSSE(); });
+            // （监听器只注册一次——放在 initSSE 里的话，bfcache 每次往返都会
+            // 累积一对监听器 + 一个 30s 图表定时器，并把 SSE 连接反复重建）
+            if (!_sseLifecycleWired) {
+                _sseLifecycleWired = true;
+                window.addEventListener('pagehide', () => { if (evtSource) { evtSource.close(); evtSource = null; } });
+                window.addEventListener('pageshow', () => { if (!evtSource) initSSE(); });
+            }
             // Chart refresh every 30s (decoupled from status)
+            if (sseChartTimer) clearInterval(sseChartTimer);
             sseChartTimer = setInterval(fetchChartData, 30000);
         }
 

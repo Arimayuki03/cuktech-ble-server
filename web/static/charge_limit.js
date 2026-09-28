@@ -60,7 +60,9 @@
 
     // 保存单个端口。wh=0 表示关闭该端口限额。
     function saveLimit(port, wh, mode) {
-        if (pending[port]) return Promise.resolve(state);
+        // pending 中：显式返回带 pending 标记的失败结果，调用方据此静默跳过
+        // （旧行为返回 state 本身，res.ok 为 undefined 会被当成"保存失败"弹窗）
+        if (pending[port]) return Promise.resolve({ ok: false, pending: true, error: 'pending', state: state });
         pending[port] = true;
         var body = { port: port, wh: wh };
         if (mode) body.mode = mode;

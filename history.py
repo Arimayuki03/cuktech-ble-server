@@ -420,7 +420,13 @@ class PortHistory:
                          FROM port_history
                          WHERE port = ? AND timestamp >= ? AND active = 1
                      ) p
-                     WHERE p.prev_ts IS NOT NULL),
+                     WHERE p.prev_ts IS NOT NULL
+                       -- 断档上限 30s（对齐 energy.AdaptiveEnergyIntegrator
+                       -- 的 MAX_GAP_SEC）：port_history 里有 active=0 的
+                       -- 空载行，被 WHERE 过滤后两次充电之间的整段空闲会
+                       -- 成为相邻 active 行的间隔，无上限时按"下一个活跃
+                       -- 样本的功率"整段计费——闲置一夜凭空多出数百 Wh
+                       AND p.timestamp - p.prev_ts <= 30),
                 0) as energy_wh
             FROM port_history
             WHERE port = ? AND timestamp >= ?""",

@@ -28,8 +28,9 @@ function fmtDuration(sec) {
 async function fetchEnergyStats(period) {
     try {
         const res = await fetch(`${API}/api/energy/stats?period=${period || 'today'}`);
+        if (!res.ok) return { total_wh: 0, session_count: 0, avg_power_w: 0, error: 'HTTP ' + res.status };
         return await res.json();
-    } catch (e) { return { total_wh: 0, session_count: 0, avg_power_w: 0 }; }
+    } catch (e) { return { total_wh: 0, session_count: 0, avg_power_w: 0, error: String(e) }; }
 }
 
 // Fetch sessions list
@@ -38,16 +39,16 @@ async function fetchSessions(port, period, limit, page) {
         let url = `${API}/api/sessions?period=${period || 'today'}&limit=${limit || 10}&page=${page || 1}`;
         if (port) url += `&port=${port}`;
         const res = await fetch(url);
+        if (!res.ok) return { sessions: [], total: 0, page: 1, pages: 1, error: 'HTTP ' + res.status };
         return await res.json();
-    } catch (e) { return { sessions: [], total: 0, page: 1, pages: 1 }; }
+    } catch (e) { return { sessions: [], total: 0, page: 1, pages: 1, error: String(e) }; }
 }
 
 let _dsTarget = 300;
 let _currentSessionId = null;
 
 function setDownsample(target) {
-    _dsTarget = parseInt(target) || 0;
-    if (_currentSessionId) showSessionDetail(_currentSessionId);
+    _dsTarget = parseInt(target) || 0;    if (_currentSessionId) showSessionDetail(_currentSessionId);
 }
 
 // Fetch session detail points
@@ -55,8 +56,9 @@ async function fetchSessionPoints(sessionId) {
     try {
         const ds = _dsTarget > 0 ? `?downsample=${_dsTarget}` : '';
         const res = await fetch(`${API}/api/sessions/${sessionId}/points${ds}`);
+        if (!res.ok) return { points: [], error: 'HTTP ' + res.status };
         return await res.json();
-    } catch (e) { return { points: [] }; }
+    } catch (e) { return { points: [], error: String(e) }; }
 }
 
 // Render stats summary
@@ -104,7 +106,7 @@ function renderSessionList(containerId, sessions, onClick) {
     }
     el.innerHTML = filtered.map(s => {
         const proto = s.protocol || '';
-        const protoHtml = proto ? `<span style="font-size:11px;color:var(--accent-ink);margin-left:6px;">${proto}</span>` : '';
+        const protoHtml = proto ? `<span style="font-size:11px;color:var(--accent-ink);margin-left:6px;">${(window.escapeHtml || (v => v))(proto)}</span>` : '';
         const isActive = s.is_active;
         const wh = (s.total_wh && s.total_wh > 0) ? s.total_wh.toFixed(1) : '0';
         const activeDot = isActive ? `<span style="display:inline-block;width:6px;height:6px;border-radius:50%;background:var(--dot-on,#34C759);margin-right:4px;animation:pulse 1.5s infinite;"></span>` : '';
@@ -132,6 +134,9 @@ function renderSessionList(containerId, sessions, onClick) {
 async function showSessionDetail(sessionId) {
     _currentSessionId = sessionId;
     const data = await fetchSessionPoints(sessionId);
+    // 竞态守卫：快速连点会话 A、B 时，A 的慢响应后到会覆盖 B 的图表，
+    // 而导出按钮读的 _currentSessionId 是 B——显示与导出内容错位。
+    if (sessionId !== _currentSessionId) return;
     if (!data.points || data.points.length === 0) return;
 
     const points = data.points;
@@ -308,7 +313,10 @@ function startChargeHistoryAutoRefresh(containerId, statsId, period, interval, p
     if (pageSize > 0) _chPageSize = pageSize;
     window._chPeriod = period;
     refreshChargeHistory();
-    setInterval(refreshChargeHistory, interval || 30000);
+    // 防重复轮询：重复调用本函数时先清掉旧 interval（SSE 监听有 _chSseListening
+    // 守卫，这里补上对应防护，避免双倍轮询）
+    if (window._chRefreshTimer) clearInterval(window._chRefreshTimer);
+    window._chRefreshTimer = setInterval(refreshChargeHistory, interval || 30000);
     // SSE: refresh immediately on session completion
     // Listen for CustomEvent dispatched by main SSE handler (avoids second SSE connection)
     if (!window._chSseListening) {
@@ -371,8 +379,8 @@ function renderPagination(containerId, data) {
         <button onclick="chGoPage(${Math.max(1, data.page - 1)})" ${data.page <= 1 ? 'disabled' : ''}
             style="${data.page <= 1 ? disStyle : btnStyle}">${I18N.t('charge.prevPage')}</button>
         <span style="color:var(--text-dim);">${data.page} / ${data.pages}</span>
-        <button onclick="chGoPage(${Math.min(data.pages, data.page + 1)})" ${data.page >= data.pages - 1 ? 'disabled' : ''}
-            style="${data.page >= data.pages - 1 ? disStyle : btnStyle}">${I18N.t('charge.nextPage')}</button>`;
+        <button onclick="chGoPage(${Math.min(data.pages, data.page + 1)})" ${data.page >= data.pages ? 'disabled' : ''}
+            style="${data.page >= data.pages ? disStyle : btnStyle}">${I18N.t('charge.nextPage')}</button>`;
     el.appendChild(pag);
 }
 

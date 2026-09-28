@@ -153,7 +153,7 @@ class XiaomiCloudClient:
         sn = _signed_nonce(self._ssecurity, nonce)
         fields = _generate_enc_params(url, "POST", sn, nonce, params, self._ssecurity)
         try:
-            response = self._session.post(url, headers=headers, cookies=cookies, params=fields)
+            response = self._session.post(url, headers=headers, cookies=cookies, params=fields, timeout=(5, 30))
             if response.status_code == 200:
                 decoded = _decrypt_rc4(_signed_nonce(self._ssecurity, fields["_nonce"]), response.text)
                 return json.loads(decoded)
@@ -164,7 +164,7 @@ class XiaomiCloudClient:
     def _login_step_1(self):
         url = "https://account.xiaomi.com/pass/serviceLogin?sid=xiaomiio&_json=true"
         headers = {"User-Agent": self._agent, "Content-Type": "application/x-www-form-urlencoded"}
-        response = self._session.get(url, headers=headers, cookies={"userId": self._username})
+        response = self._session.get(url, headers=headers, cookies={"userId": self._username}, timeout=(5, 30))
         if response.status_code != 200:
             return False
         json_resp = self._to_json(response.text)
@@ -189,7 +189,7 @@ class XiaomiCloudClient:
                    "user": self._username,
                    "_sign": getattr(self, "_sign", ""),
                    "_json": "true"}
-        response = self._session.post(url, headers=headers, params=fields, allow_redirects=False)
+        response = self._session.post(url, headers=headers, params=fields, allow_redirects=False, timeout=(5, 30))
         if response.status_code != 200:
             return False
         json_resp = self._to_json(response.text)
@@ -211,7 +211,7 @@ class XiaomiCloudClient:
         if not self._location:
             return True
         headers = {"User-Agent": self._agent, "Content-Type": "application/x-www-form-urlencoded"}
-        response = self._session.get(self._location, headers=headers)
+        response = self._session.get(self._location, headers=headers, timeout=(5, 30))
         if response.status_code == 200:
             self._service_token = response.cookies.get("serviceToken")
             return self._service_token is not None
@@ -255,7 +255,7 @@ class QrCodeXiaomiCloudClient:
             "_locale": "en_GB",
             "_dc": str(int(time.time() * 1000))
         }
-        response = self._session.get(url, params=data)
+        response = self._session.get(url, params=data, timeout=(5, 30))
         if response.status_code != 200:
             raise XiaomiCloudLoginError("获取二维码失败")
 
@@ -270,7 +270,7 @@ class QrCodeXiaomiCloudClient:
         _LOGGER.info("QR login: login_url=%s", self._login_url[:120] if self._login_url else "None")
 
         # Download QR image
-        qr_resp = self._session.get(self._qr_image_url)
+        qr_resp = self._session.get(self._qr_image_url, timeout=(5, 30))
         qr_base64 = None
         if qr_resp.status_code == 200 and qr_resp.content:
             import base64
@@ -320,7 +320,14 @@ class QrCodeXiaomiCloudClient:
                     self._poll_done = True
                     return
                 else:
+                    # 非 200 不能无限快速重试（重试风暴触发限流/封禁）：
+                    # 退避 2s 并尊重总超时
                     _LOGGER.error("Background long-poll failed: %d", response.status_code)
+                    if time.time() - start_time > self._timeout:
+                        self._poll_error = XiaomiCloudLoginError("登录轮询超时")
+                        self._poll_done = True
+                        return
+                    time.sleep(2)
         except Exception as e:
             _LOGGER.error("Background long-poll exception: %s", e)
             self._poll_error = XiaomiCloudLoginError(f"登录异常: {e}")
@@ -344,7 +351,7 @@ class QrCodeXiaomiCloudClient:
         # Get serviceToken — location URL is one-time-use, only call once
         headers = {"User-Agent": self._agent, "Content-Type": "application/x-www-form-urlencoded"}
         _LOGGER.info("Following location URL (one-time)")
-        response = self._session.get(self._location, headers=headers)
+        response = self._session.get(self._location, headers=headers, timeout=(5, 30))
         _LOGGER.info("Location response: status=%d", response.status_code)
         self._service_token = response.cookies.get("serviceToken")
         if not self._service_token:
@@ -408,7 +415,12 @@ class QrCodeXiaomiCloudClient:
         result = self._api_call(f"{url}/v2/device/blt_get_beaconkey", {
             "data": json.dumps({"did": did, "pdid": 1})
         })
-        _LOGGER.info("beaconkey response: %s", result)
+        # beaconkey 是长期 BLE 凭据，绝不能整体进日志（docker logs / 日志文件
+        # 任何读者都可拿它直接对设备发起认证控制）——只记录 code 与是否存在
+        _LOGGER.info("beaconkey: code=%s, key_found=%s",
+                     result.get("code") if isinstance(result, dict) else "?",
+                     bool(isinstance(result, dict)
+                          and result.get("result", {}).get("beaconkey")))
         if result and result.get("code") == 0:
             key = result.get("result", {}).get("beaconkey", "")
             if key:
@@ -438,7 +450,7 @@ class QrCodeXiaomiCloudClient:
         sn = _signed_nonce(self._ssecurity, nonce)
         fields = _generate_enc_params(url, "POST", sn, nonce, params, self._ssecurity)
         try:
-            response = self._session.post(url, headers=headers, cookies=cookies, params=fields)
+            response = self._session.post(url, headers=headers, cookies=cookies, params=fields, timeout=(5, 30))
             if response.status_code == 200:
                 decoded = _decrypt_rc4(_signed_nonce(self._ssecurity, fields["_nonce"]), response.text)
                 return json.loads(decoded)

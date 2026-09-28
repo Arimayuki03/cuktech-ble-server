@@ -1014,18 +1014,24 @@ class CuktechBLEController:
         return None, None
 
     async def get_properties(self, props):
-        """批量获取属性。props = [(siid, piid), ...]"""
-        async def fetch_one(siid, piid):
-            result = await self.send_miot_command(siid, piid)
-            return (siid, piid), result.get('value') if result else None
+        """批量获取属性。props = [(siid, piid), ...]
 
-        tasks = [fetch_one(siid, piid) for siid, piid in props]
-        results_list = await asyncio.gather(*tasks, return_exceptions=True)
-
+        注意：必须顺序执行——命令通道是单实例共享状态（_send_it/_miot_seq/
+        RCV_RDY-RCV_OK 握手/cmd_recv 响应队列），并发 send_miot_command 会
+        互吞握手与响应。gather(return_exceptions=True) 的异常项也不能直接
+        解包（异常对象不是 tuple，解包抛 TypeError）。
+        """
         results = {}
         failed = 0
-        for (siid, piid), value in results_list:
-            if isinstance(value, Exception) or value is None:
+        for siid, piid in props:
+            try:
+                result = await self.send_miot_command(siid, piid)
+            except Exception as e:
+                _LOGGER.warning("get_properties (%s,%s) exception: %s", siid, piid, e)
+                failed += 1
+                continue
+            value = result.get('value') if result else None
+            if value is None:
                 failed += 1
             else:
                 results[(siid, piid)] = value

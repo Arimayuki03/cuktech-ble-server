@@ -178,6 +178,42 @@ class BemfaClient:
             except Exception:
                 pass
             self._client = None
+            # 首连失败必须留出重试通道：ping 循环的未连接分支只重排自身，
+            # 永远不会再调 _connect_mqtt——不安排重试的话，启动时网络抖动
+            # （DNS 未就绪等）会让语音控制静默失效到进程重启。
+            self._schedule_reconnect()
+
+    _RECONNECT_DELAYS = (5, 15, 30, 60)  # 秒，封顶后按 60s 周期重试
+
+    def _schedule_reconnect(self):
+        """线程安全地安排一次延迟重连（可从 executor 线程调用）。"""
+        def _delayed_reconnect():
+            delay = self._RECONNECT_DELAYS[min(self._reconnect_attempt,
+                                               len(self._RECONNECT_DELAYS) - 1)]
+            self._reconnect_attempt += 1
+            _LOGGER.warning("Bemfa MQTT retry #%d in %ds", self._reconnect_attempt, delay)
+            timer = threading.Timer(delay, self._retry_connect)
+            timer.daemon = True
+            timer.start()
+
+        self._reconnect_attempt = getattr(self, "_reconnect_attempt", 0)
+        _delayed_reconnect()
+
+    def _retry_connect(self):
+        """在 executor 里重试 MQTT 连接（成功后 attempt 归零在 _on_connect）。"""
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            # 无运行中事件循环（Timer 线程）：开新 loop 同步执行
+            asyncio.run(self._retry_connect_async())
+            return
+        asyncio.run_coroutine_threadsafe(self._retry_connect_async(), loop)
+
+    async def _retry_connect_async(self):
+        with self._lock:
+            if self._connected or self._client is not None:
+                return  # 已恢复，无需重试
+        await asyncio.get_running_loop().run_in_executor(None, self._connect_mqtt)
 
     def _disconnect_mqtt(self):
         if self._client:
@@ -191,6 +227,7 @@ class BemfaClient:
             with self._lock:
                 self._connected = True
             self._connect_time = time.time()
+            self._reconnect_attempt = 0  # 成功连接：重连退避归零
             _LOGGER.info("Bemfa MQTT connected")
 
             # Subscribe to all device topics

@@ -1309,7 +1309,14 @@ class BLEManager:
     async def _handle_set_command(self, cmd_data, cmd_future):
         piid, value = cmd_data
         try:
-            await self.ctrl.send_miot_command(2, piid, value=value)
+            result = await self.ctrl.send_miot_command(2, piid, value=value)
+            # send_miot_command 发送失败/无响应返回 None（不抛异常）——
+            # 此时不更新状态缓存、不报成功，否则 UI 假成功而设备未生效
+            if result is None:
+                _LOGGER.warning("Set command piid=%s: no response (send failed or timeout)", piid)
+                if cmd_future and not cmd_future.done():
+                    cmd_future.set_result({"ok": False, "error": "no response from device"})
+                return
             await self.state.update_settings({str(piid): value})
             # 同步协议扩展缓存，防止后续 toggle 读到过期值
             if piid == 21:
@@ -1329,9 +1336,14 @@ class BLEManager:
         port, action = cmd_data
         try:
             cur = await self.ctrl.send_miot_command(2, 16)
-            cur_val = cur.get("value", 0) if cur else 0
-            if cur is None:
-                _LOGGER.warning('Failed to read port state, using 0')
+            # GET 失败（链路瞬断/无响应）时绝不能以 0 为基线做读-改-写：
+            # 那会把其余正在充电的端口全部清零关断。宁可让本次命令失败。
+            if cur is None or cur.get("value") is None:
+                _LOGGER.warning("Port command %s %s: cannot read current port state, rejecting", port, action)
+                if cmd_future and not cmd_future.done():
+                    cmd_future.set_result({"ok": False, "error": "cannot read current port state"})
+                return
+            cur_val = cur["value"]
             if port == "all":
                 new_val = 0x0F if action == "on" else 0x00
             else:
@@ -1690,11 +1702,23 @@ class BLEManager:
         await self.ctrl.client.write_gatt_char(
             CHAR_CMD_RECV, bytes([0x00, 0x00, 0x01, 0x01]), response=False)
         received_count = 0
-        for _ in range(frame_count):
+        # 熔断：设备发多帧头后中途停止（链路劣化/头损坏）时，wait_notify
+        # 超时返回 None 而非抛异常，若无 break 会把剩余帧数 × 3s 全部等满
+        # （1000 帧 ≈ 50 分钟），阻塞主循环内所有命令与探活。钳制帧数上限
+        # 并加整体 deadline，None 即终止。
+        deadline = asyncio.get_running_loop().time() + 30.0
+        for _ in range(min(frame_count, 100)):
+            if asyncio.get_running_loop().time() > deadline:
+                _LOGGER.warning("Multiframe deadline exceeded at frame %d/%d",
+                                received_count, frame_count)
+                break
             frame = await self.ctrl.wait_notify("cmd_recv", timeout=3.0)
-            if frame:
-                received_count += 1
-                await self._try_process_inline_frame(frame)
+            if not frame:
+                _LOGGER.warning("Multiframe stopped early: %d/%d frames",
+                                received_count, frame_count)
+                break
+            received_count += 1
+            await self._try_process_inline_frame(frame)
         await self.ctrl.client.write_gatt_char(
             CHAR_CMD_RECV, bytes([0x00, 0x00, 0x01, 0x00]), response=False)
         if received_count != frame_count:

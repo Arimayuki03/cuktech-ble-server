@@ -124,7 +124,7 @@ async function fetchStatus() {
         if (data.settings) {
             state.settings = data.settings;
             const sceneVal = data.settings['5'];
-            if (sceneVal && sceneVal > 0 && !isRecentLocal()) state.scene = sceneVal;
+            if (sceneVal && !isRecentLocal() && [1, 2, 3, 4].includes(sceneVal)) state.scene = sceneVal;
             if (!isRecentLocal()) {
                 if (data.settings['6'] !== undefined) state.screenTime = data.settings['6'];
                 if (data.settings['15'] !== undefined) state.trickleEnabled = data.settings['15'] === 1;
@@ -761,6 +761,7 @@ async function applyChargeLimit(key) {
     if (wh === null) { toast(I18N.t('chargeLimit.saveFailed', { msg: I18N.t('chargeLimit.placeholder') })); return; }
     if (modeEl) modeEl.dataset.touched = '1';
     const res = await ChargeLimit.saveLimit(key, wh, modeEl ? modeEl.value : null);
+    if (res.pending) return;  // 上一请求仍在进行,静默跳过(与 app.js 对齐,勿弹"失败:pending")
     if (modeEl) modeEl.dataset.touched = '';
     toast(res.ok
         ? (wh > 0 ? I18N.t('chargeLimit.saved') : I18N.t('chargeLimit.cleared'))
@@ -770,6 +771,7 @@ async function applyChargeLimit(key) {
 
 async function clearChargeLimit(key) {
     const res = await ChargeLimit.saveLimit(key, 0, null);
+    if (res.pending) return;  // 上一请求仍在进行,静默跳过
     toast(res.ok ? I18N.t('chargeLimit.cleared')
                  : I18N.t('chargeLimit.saveFailed', { msg: res.error }));
     updateChargeLimitUI();
@@ -820,7 +822,12 @@ function renderDelayOff() {
             slider.onchange = async function() {
                 const v = parseInt(this.value);
                 markLocalChange();
-                try { await fetch(`${API_BASE}/api/set`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ piid: DELAY_PIIDS[key], value: v }) }); } catch(e) {}
+                try {
+                    // 契约:BLE 命令离线时仍返回 200,错误在 body 的 ok:false
+                    const res = await fetch(`${API_BASE}/api/set`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ piid: DELAY_PIIDS[key], value: v }) });
+                    const result = await res.json();
+                    if (!result.ok) toast(I18N.t('common.setFailed', { msg: result.error || I18N.t('common.unknownError') }));
+                } catch(e) {}
             };
         }
     }
@@ -828,12 +835,20 @@ function renderDelayOff() {
 
 // ── Actions ──
 async function setScene(mode) {
+    const prev = state.scene;
     state.scene = mode;
     markLocalChange();
     renderAll();
     try {
-        await fetch(`${API_BASE}/api/set`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ piid: SCENE_PIID, value: mode }) });
-    } catch(e) { console.error('setScene error:', e); }
+        // 失败回滚乐观更新(契约:离线返回 200+ok:false)
+        const res = await fetch(`${API_BASE}/api/set`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ piid: SCENE_PIID, value: mode }) });
+        const result = await res.json();
+        if (!result.ok) {
+            state.scene = prev;
+            renderAll();
+            toast(I18N.t('common.setFailed', { msg: result.error || I18N.t('common.unknownError') }));
+        }
+    } catch(e) { console.error('setScene error:', e); state.scene = prev; renderAll(); }
 }
 
 async function togglePort(key) {
@@ -842,14 +857,34 @@ async function togglePort(key) {
     markLocalChange();
     renderAll();
     try {
-        await fetch(`${API_BASE}/api/port`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ port: key, action: on ? 'on' : 'off' }) });
-    } catch(e) { console.error(e); }
+        // 失败回滚开关(契约:离线返回 200+ok:false)
+        const res = await fetch(`${API_BASE}/api/port`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ port: key, action: on ? 'on' : 'off' }) });
+        const result = await res.json();
+        if (!result.ok) {
+            state.ports[key].enabled = !on;
+            renderAll();
+            toast(I18N.t('common.setFailed', { msg: result.error || I18N.t('common.unknownError') }));
+        }
+    } catch(e) {
+        console.error(e);
+        state.ports[key].enabled = !on;
+        renderAll();
+    }
 }
 
 async function toggleTrickle() {
+    const prev = state.trickleEnabled;
     state.trickleEnabled = !state.trickleEnabled;
     markLocalChange();
-    try { await fetch(`${API_BASE}/api/set`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ piid: 15, value: state.trickleEnabled ? 1 : 0 }) }); } catch(e) {}
+    try {
+        const res = await fetch(`${API_BASE}/api/set`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ piid: 15, value: state.trickleEnabled ? 1 : 0 }) });
+        const result = await res.json();
+        if (!result.ok) {
+            state.trickleEnabled = prev;
+            renderAll();
+            toast(I18N.t('common.setFailed', { msg: result.error || I18N.t('common.unknownError') }));
+        }
+    } catch(e) { state.trickleEnabled = prev; renderAll(); }
 }
 
 async function cycleScreenTime() {
@@ -858,7 +893,11 @@ async function cycleScreenTime() {
     document.getElementById('screenTimeVal').innerHTML =
         screenTimeLabel(state.screenTime) + ' <img src="static/plugin_imgs/main_charger_dark_icon_more.png" alt="">';
     markLocalChange();
-    try { await fetch(`${API_BASE}/api/set`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ piid: 6, value: state.screenTime }) }); } catch(e) {}
+    try {
+        const res = await fetch(`${API_BASE}/api/set`, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ piid: 6, value: state.screenTime }) });
+        const result = await res.json();
+        if (!result.ok) toast(I18N.t('common.setFailed', { msg: result.error || I18N.t('common.unknownError') }));
+    } catch(e) {}
 }
 
 // ── Top-view fade on scroll ──
@@ -1052,6 +1091,13 @@ function initPhoneSSE() {
     };
     evtSource.onerror = () => {
         document.getElementById('connectDot').style.background = '#666';
+        // 服务端 /api/events 120s 硬超时返回 504（非 200）——按 SSE 规范
+        // 浏览器 fail the connection（readyState → CLOSED），内建重连对此
+        // 无效，必须手动重建，否则实时数据 2 分钟后静默冻结
+        if (phoneEvtSource && phoneEvtSource.readyState === EventSource.CLOSED) {
+            phoneEvtSource = null;
+            setTimeout(initPhoneSSE, 3000);
+        }
     };
 }
 
@@ -1111,7 +1157,7 @@ function applyPortUpdate(portId, portData) {
 function applySettingsUpdate(settings) {
     state.settings = settings;
     const sceneVal = settings['5'];
-    if (sceneVal && sceneVal > 0 && !isRecentLocal()) state.scene = sceneVal;
+    if (sceneVal && !isRecentLocal() && [1, 2, 3, 4].includes(sceneVal)) state.scene = sceneVal;
     if (!isRecentLocal()) {
         if (settings['6'] !== undefined) state.screenTime = settings['6'];
         if (settings['15'] !== undefined) state.trickleEnabled = settings['15'] === 1;

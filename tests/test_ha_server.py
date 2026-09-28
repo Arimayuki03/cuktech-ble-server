@@ -148,7 +148,13 @@ class TestHandleExport:
 
 
 class TestHandleLogLevel:
-    """Test log level API endpoint."""
+    """Test log level API endpoint.
+
+    POST 分支会真实持久化到 _config_path()（默认仓库 config.yaml，含
+    BLE token 且被 .gitignore 无法用 git 恢复）——测试必须用
+    monkeypatch 把 CUKTECH_CONFIG_PATH 指到临时文件，否则每跑一次
+    套件就重写一次生产配置（yaml.dump 还会重排键序、丢弃注释）。
+    """
 
     @pytest.mark.asyncio
     async def test_get_log_level(self):
@@ -164,8 +170,9 @@ class TestHandleLogLevel:
         assert body["level"] in ["debug", "info", "warning", "error"]
 
     @pytest.mark.asyncio
-    async def test_set_log_level(self):
+    async def test_set_log_level(self, tmp_path, monkeypatch):
         from ha_server import Server
+        monkeypatch.setenv("CUKTECH_CONFIG_PATH", str(tmp_path / "config.yaml"))
         s = Server.__new__(Server)
 
         request = AsyncMock()
@@ -177,8 +184,9 @@ class TestHandleLogLevel:
         assert body["ok"] is True
 
     @pytest.mark.asyncio
-    async def test_set_invalid_log_level(self):
+    async def test_set_invalid_log_level(self, tmp_path, monkeypatch):
         from ha_server import Server
+        monkeypatch.setenv("CUKTECH_CONFIG_PATH", str(tmp_path / "config.yaml"))
         s = Server.__new__(Server)
 
         request = AsyncMock()
