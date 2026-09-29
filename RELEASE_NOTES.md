@@ -1,5 +1,13 @@
 # Release Notes
 
+## v1.1.3
+
+### Windows 自重启修复 — os.execv 后 BLE 循环卡死
+
+- **实证(2026-09-29)**:win32 下 `os.execv` 替换进程映像后,WinRT/bleak 的事件循环状态无法在新映像内重建——HTTP 服务正常应答但 BLE 连接循环静默卡死(`connected` 恒 false、无扫描日志),`POST /api/enable` 手动重启循环才恢复。触发路径:MiHome-Ex 桌面端充电器一键登录写入 `/api/config` 后的自动重启。
+- **修复**:`_restart()` 在 Windows 上改为 flush 后 `os._exit(0)` 干净退出,交给拉起方(MiHome-Ex BleServerManager 监听 QProcess finished)延迟重新拉起;Linux/BlueZ 保持 `os.execv` 原语义不变。
+- **配套**:桌面端 MiHome-Ex v0.4.3 起新增子进程意外退出自动重启(退出码 0 延迟拉起/崩溃退避最多 3 次),两端闭环。
+
 ## v1.1.2
 
 ### BLE 链路 — 多帧熔断补全与假成功清零
