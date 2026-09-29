@@ -1321,6 +1321,20 @@ class Server:
             except Exception:
                 pass
         s.history.close()
+        # Windows (win32)：os.execv 替换映像后 WinRT/bleak 的事件循环状态
+        # 无法在新映像内重建——实证（2026-09-29）：HTTP 服务正常应答但 BLE
+        # 循环静默卡死（connected 恒 false、无任何扫描日志），POST /api/enable
+        # 手动重启循环才能恢复。因此 win32 改为干净退出，交给拉起方重启：
+        # 桌面端 BleServerManager 用 QProcess 拉起并监听 finished 信号自动
+        # 重新 start()；命令行/服务方式由 systemd/服务管理器兜底。
+        # 非 Windows（Linux/BlueZ）保持 os.execv 原语义。
+        if sys.platform == "win32":
+            _LOGGER.info("Windows: exiting for supervised restart (config saved)")
+            # flush 日志后硬退出：os._exit 跳过 atexit——桌面端只看进程
+            # 退出事件，exit code 用 0（预期重启，非崩溃）
+            sys.stdout.flush()
+            sys.stderr.flush()
+            os._exit(0)
         # Re-exec: replace current process with fresh server.
         # Nuitka standalone 下 sys.executable 是编译产物自身，
         # 传 ha_server.py 参数会失败；直接重跑 exe（数据文件在同级目录）。
