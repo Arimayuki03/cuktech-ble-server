@@ -1,4 +1,25 @@
+<div align="center">
+
 # CUKTECH 10 GaN Charger Ultra - BLE Server
+
+**独立的 BLE 服务器，连接 CUKTECH 充电器，SSE/MQTT 实时推送至 Web 前端与 Home Assistant**
+
+[![Release](https://img.shields.io/github/v/release/Arimayuki03/cuktech-ble-server?logo=github&label=%E7%89%88%E6%9C%AC)](https://github.com/Arimayuki03/cuktech-ble-server/releases/latest)
+[![License](https://img.shields.io/github/license/Arimayuki03/cuktech-ble-server?label=%E8%AE%B8%E5%8F%AF%E8%AF%81)](LICENSE)
+[![Platform](https://img.shields.io/badge/%E5%B9%B3%E5%8F%B0-Linux%20%7C%20Docker-9cf?logo=linux&logoColor=white)](https://github.com/Arimayuki03/cuktech-ble-server)
+[![Python](https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
+[![BLE](https://img.shields.io/badge/BLE-BlueZ%205.66%2B-0082FC?logo=bluetooth&logoColor=white)](https://www.bluez.org/)
+[![Home Assistant](https://img.shields.io/badge/Home%20Assistant-MQTT-41BDF5?logo=homeassistant&logoColor=white)](https://www.home-assistant.io/)
+[![Stars](https://img.shields.io/github/stars/Arimayuki03/cuktech-ble-server?style=social)](https://github.com/Arimayuki03/cuktech-ble-server/stargazers)
+
+**[功能特性](#功能特性) · [快速开始](#快速开始推荐) · [Web 界面](#web-管理界面) · [HTTP API](#http-api) · [致谢](#致谢)**
+
+</div>
+
+---
+
+> [!NOTE]
+> 本仓库是 [kairui1108/cuktech-ble-server](https://github.com/kairui1108/cuktech-ble-server)（原 cuktech-ble-ha）的维护 fork，在上游基础上持续修复 BLE 链路稳定性、竞态与安全问题，并作为 [Arimayuki03/MiHome-Ex](https://github.com/Arimayuki03/MiHome-Ex) 桌面端的内置充电器数据源。
 
 独立的 BLE 服务器，用于连接 CUKTECH 充电器并通过 MQTT 推送实时数据到 Home Assistant。
 
@@ -43,8 +64,8 @@
 
 ```bash
 # 1. 克隆仓库
-git clone https://github.com/kairui1108/cuktech-ble-ha.git
-cd cuktech-ble-ha/ble_server
+git clone https://github.com/Arimayuki03/cuktech-ble-server.git
+cd cuktech-ble-server
 
 # 2. 安装依赖
 python3 -m venv .venv
@@ -123,8 +144,8 @@ docker run -d \
 ```bash
 # 创建配置文件（不要用 touch，空文件会覆盖容器内默认配置）
 # 方式一：克隆仓库后复制模板
-git clone https://github.com/kairui1108/cuktech-ble-ha.git
-cd kuktech-ble-ha/ble_server
+git clone https://github.com/Arimayuki03/cuktech-ble-server.git
+cd cuktech-ble-server
 cp config.yaml.example config.yaml
 
 # 方式二：直接写入默认配置（无需 clone）

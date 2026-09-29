@@ -33,8 +33,10 @@ jobs:
       - name: Sync files
         run: |
           rsync -av --delete --exclude='.git' --exclude='.github' --exclude='.venv' --exclude='__pycache__' --exclude='*.pyc' /tmp/upstream/ble_server/ ./
-          cp /tmp/upstream/docs/server-readme.md README.md
-          cp /tmp/upstream/docs/server-readme-en.md README.en.md
+          # README 由本 fork 维护（徽标/fork 说明/克隆地址），不从上游覆盖；
+          # 上游 README 备份到 docs/ 供对照
+          cp /tmp/upstream/docs/server-readme.md docs/upstream-server-readme.md 2>/dev/null || true
+          cp /tmp/upstream/docs/server-readme-en.md docs/upstream-server-readme-en.md 2>/dev/null || true
           mkdir -p systemd
           cp /tmp/upstream/ble_server/systemd/* systemd/ 2>/dev/null || true
 
@@ -60,7 +62,7 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git remote set-url origin https://${{ secrets.PAT_TOKEN }}@github.com/kairui1108/cuktech-ble-server.git
+          git remote set-url origin https://${{ secrets.PAT_TOKEN }}@github.com/Arimayuki03/cuktech-ble-server.git
           git add .
           if ! git diff --cached --quiet; then
             VERSION="${{ steps.version.outputs.upstream }}"
@@ -94,7 +96,7 @@ jobs:
             ## Installation
 
             ```bash
-            git clone https://github.com/kairui1108/cuktech-ble-server.git
+            git clone https://github.com/Arimayuki03/cuktech-ble-server.git
             cd cuktech-ble-server
             python3 -m venv .venv
             source .venv/bin/activate
