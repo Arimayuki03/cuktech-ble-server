@@ -848,8 +848,15 @@ class CuktechBLEController:
             tl & 0xFF, (tl >> 8) & 0xFF,
         ]) + value_bytes
 
-    async def send_miot_command(self, siid, piid, value=None):
+    async def send_miot_command(self, siid, piid, value=None, timeout=None):
         """发送 MiOT BLE 命令并返回解析后的响应。
+
+        timeout 覆盖响应等待上限（秒，默认 8.0）：端口开关等调用方需要
+        更短的单步超时，以便在整体命令超时窗口内完成有界重试。
+
+        注意 timeout 只约束响应等待，不含发送阶段：_send_encrypted 的
+        RCV_RDY/RCV_OK 握手各有一次 wait_notify(3.0)。编排重试预算时，
+        单次 send_miot_command 的墙钟上限应按 timeout + 握手时间估算。
 
         MiOT/Spec TLV 帧格式 (对齐米家 SpecWriteChannelManager):
           frame_header: [tot_len:1B] [0x20:1B]   — 0x20xx, xx=总长度
@@ -886,13 +893,19 @@ class CuktechBLEController:
 
         # 接收响应 (根据 opcode 区分)
         if value is not None:
-            return await self._recv_set_response(siid, piid, timeout=8.0)
+            return await self._recv_set_response(siid, piid, timeout=timeout or 8.0)
         else:
-            return await self._recv_get_response(siid, piid, timeout=8.0)
+            return await self._recv_get_response(siid, piid, timeout=timeout or 8.0)
 
     async def _recv_set_response(self, siid, piid, timeout=8.0):
-        """接收 SET 命令的响应: 期望 ACK (B4=0x01) + Result (B4=0x04)。"""
-        deadline = asyncio.get_running_loop().time() + timeout
+        """接收 SET 命令的响应: 期望 ACK (B4=0x01) + Result (B4=0x04)。
+
+        timeout 是该步的硬上限：ACK 后的 Result 等待只在 timeout 之内
+        延展（且最多 2.5s），不会无限期推迟——调用方（如端口开关的重试
+        编排）据此估算超时预算才有效。
+        """
+        hard_deadline = asyncio.get_running_loop().time() + timeout
+        deadline = hard_deadline
         got_ack = False
 
         while True:
@@ -914,8 +927,11 @@ class CuktechBLEController:
             if b4 == 0x01 and pt_siid == (siid & 0xFF) and pt_piid == (piid & 0xFF):
                 got_ack = True
                 # ACK 后给 Result 留足时间（设备偶尔 >1s 才回 Result），
-                # 减少只收到 ACK 就按 "ACK-only" 空结果返回的频率
-                deadline = asyncio.get_running_loop().time() + 2.5
+                # 减少只收到 ACK 就按 "ACK-only" 空结果返回的频率。
+                # 延展必须受本步硬上限约束（且不超过 2.5s），否则 deadline
+                # 被无限推迟、调用方的超时预算失效
+                deadline = min(asyncio.get_running_loop().time() + 2.5,
+                               hard_deadline)
                 continue
             elif b4 == 0x04 and pt_siid == (siid & 0xFF) and pt_piid == (piid & 0xFF):
                 val = None

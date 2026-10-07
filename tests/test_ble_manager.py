@@ -22,7 +22,7 @@ def make_config():
     config = MagicMock()
     config.server.reconnect_base_delay = 1.0
     config.server.reconnect_max_delay = 300.0
-    config.server.command_timeout = 10.0
+    config.server.command_timeout = 20.0
     config.server.settings_refresh_interval = 60.0
     config.topic_status = "cuktech/charger/status"
     config.topic_settings = "cuktech/charger/settings"
@@ -226,11 +226,11 @@ class TestProcessCommands:
 
     @pytest.mark.asyncio
     async def test_process_port_command_write_unconfirmed(self):
-        """port SET 写入返回 None（未确认）→ 不更新缓存、不关会话、报 ok:False。"""
+        """port SET 写入两轮均未确认 → 报 ok:False，缓存/会话副作用不执行。"""
         mgr = make_manager()
         mgr.ctrl = MagicMock()
 
-        def send_miot_command(siid, piid, value=None):
+        def send_miot_command(siid, piid, value=None, timeout=None):
             if value is not None:
                 return None  # 写步骤未确认 → None
             return {"value": 0x01}  # GET 正常
@@ -246,9 +246,134 @@ class TestProcessCommands:
         assert future.done()
         result = future.result()
         assert result["ok"] is False
-        assert result["error"] == "port write not confirmed"
+        assert result["error"] == "port command failed after retry"
+        # 两轮共 2 次 GET + 2 次 SET（首轮失败后重试过一轮）
+        assert mgr.ctrl.send_miot_command.await_count == 4
         # 副作用全部跳过：缓存未变、会话未闭合
         assert mgr.state.settings.get("16") != 0x00
+        assert mgr._energy_states[1].is_charging is True
+
+    @pytest.mark.asyncio
+    async def test_process_port_command_retry_after_unconfirmed_write(self):
+        """首轮 SET 未确认但设备实际已生效 → 重读发现目标态，不重复写、报成功。"""
+        mgr = make_manager()
+        mgr.ctrl = MagicMock()
+
+        get_count = {"n": 0}
+
+        def send_miot_command(siid, piid, value=None, timeout=None):
+            if value is None:
+                # GET：首轮基线 0x01（C1 开），重试时已变成 0x00（写入生效）
+                get_count["n"] += 1
+                return {"value": 0x01 if get_count["n"] == 1 else 0x00}
+            return None  # SET 永远"未确认"（Result 丢失）
+        mgr.ctrl.send_miot_command = AsyncMock(side_effect=send_miot_command)
+        mgr._energy_states[1].is_charging = True
+        mgr._energy_states[1].session_wh = 5.0
+
+        future = asyncio.get_running_loop().create_future()
+        await mgr.cmd_queue.put(("port", ("c1", "off"), future))
+
+        await mgr._process_commands()
+
+        assert future.done()
+        result = future.result()
+        assert result["ok"] is True
+        assert result["value"] == 0x00
+        # 首轮 GET+SET + 重试 GET（基线已是目标态，不再写）
+        assert mgr.ctrl.send_miot_command.await_count == 3
+        # 副作用按确认结果执行：缓存更新、会话关闭
+        assert mgr.state.settings.get("16") == 0x00
+        assert mgr._energy_states[1].is_charging is False
+
+    @pytest.mark.asyncio
+    async def test_process_port_command_set_ack_only_rejected(self):
+        """SET 只回 ACK（value=None）不算确认 → 重试，两轮都 ACK 才报失败。"""
+        mgr = make_manager()
+        mgr.ctrl = MagicMock()
+
+        def send_miot_command(siid, piid, value=None, timeout=None):
+            if value is not None:
+                return {"piid": 16, "value": None, "raw": None}  # ACK-only
+            return {"value": 0x01}
+        mgr.ctrl.send_miot_command = AsyncMock(side_effect=send_miot_command)
+
+        future = asyncio.get_running_loop().create_future()
+        await mgr.cmd_queue.put(("port", ("c1", "off"), future))
+
+        await mgr._process_commands()
+
+        assert future.done()
+        result = future.result()
+        assert result["ok"] is False
+        # 缓存不得被假成功污染
+        assert mgr.state.settings.get("16") != 0x02
+
+    @pytest.mark.asyncio
+    async def test_process_port_command_retries_on_transport_exception(self):
+        """首轮抛传输异常（GATT 写失败等）→ 重试一轮，不首轮即终止。"""
+        mgr = make_manager()
+        mgr.ctrl = MagicMock()
+
+        calls = {"n": 0}
+
+        def send_miot_command(siid, piid, value=None, timeout=None):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                raise OSError("BLE write failed")
+            # 基线 0x0E（C1 关），下发 c1 "on" → 需要真正写入
+            return {"value": 0x0E}
+        mgr.ctrl.send_miot_command = AsyncMock(side_effect=send_miot_command)
+
+        future = asyncio.get_running_loop().create_future()
+        await mgr.cmd_queue.put(("port", ("c1", "on"), future))
+
+        await mgr._process_commands()
+
+        assert future.done()
+        # 首轮异常被计入失败并重试，第二轮 GET+SET 成功
+        assert future.result()["ok"] is True
+        assert future.result()["value"] == 0x0F
+        assert calls["n"] == 3  # 首轮 GET(抛异常) + 重试 GET + SET
+
+    @pytest.mark.asyncio
+    async def test_process_port_command_skips_when_caller_gone(self):
+        """调用方已超时（future 已取消）→ 跳过，不写设备。"""
+        mgr = make_manager()
+        mgr.ctrl = MagicMock()
+        mgr.ctrl.send_miot_command = AsyncMock(return_value={"value": 0x0F})
+
+        future = asyncio.get_running_loop().create_future()
+        future.cancel()
+        await mgr.cmd_queue.put(("port", ("c1", "off"), future))
+
+        await mgr._process_commands()
+
+        # 完全没发命令，也没有副作用
+        mgr.ctrl.send_miot_command.assert_not_awaited()
+        assert mgr.state.settings.get("16") is None
+
+    @pytest.mark.asyncio
+    async def test_process_port_command_already_target_no_side_effect(self):
+        """端口已处于目标态：报成功但不重复关会话/发事件（位图无变化）。"""
+        mgr = make_manager()
+        mgr.ctrl = MagicMock()
+        # 基线 0x01（C1 已开），再次下发 c1 "on" → 位图无变化
+        mgr.ctrl.send_miot_command = AsyncMock(return_value={"value": 0x01})
+        mgr._energy_states[1].is_charging = True
+        mgr._energy_states[1].session_wh = 5.0
+
+        future = asyncio.get_running_loop().create_future()
+        await mgr.cmd_queue.put(("port", ("c1", "on"), future))
+
+        await mgr._process_commands()
+
+        assert future.done()
+        assert future.result()["ok"] is True
+        # 只 GET 一次，不写
+        assert mgr.ctrl.send_miot_command.await_count == 1
+        # 无变化不提交副作用：缓存未被写、会话仍在
+        assert mgr.state.settings.get("16") is None
         assert mgr._energy_states[1].is_charging is True
 
 

@@ -21,7 +21,7 @@ mqtt:
 server:
   host: "0.0.0.0"
   port: 8199       # Win 系统可能占用 8199 端口，改为 18199
-  command_timeout: 10.0
+  command_timeout: 20.0
   reconnect_base_delay: 1.0       # 初始重连延迟（秒）
   reconnect_max_delay: 300.0      # 最大重连延迟（秒）
   settings_refresh_interval: 10.0 # 端口状态刷新间隔（秒）

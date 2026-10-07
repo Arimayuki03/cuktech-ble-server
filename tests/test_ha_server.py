@@ -531,7 +531,7 @@ class TestChargeLimitsAPI:
         config = MagicMock()
         config.server.reconnect_base_delay = 1.0
         config.server.reconnect_max_delay = 300.0
-        config.server.command_timeout = 10.0
+        config.server.command_timeout = 20.0
         config.server.settings_refresh_interval = 60.0
         config.topic_status = "cuktech/charger/status"
         config.topic_settings = "cuktech/charger/settings"
@@ -721,7 +721,7 @@ class TestShutdownPreservesOnceLimit:
 
         cfg = MagicMock()
         for k, v in dict(reconnect_base_delay=1.0, reconnect_max_delay=300.0,
-                         command_timeout=10.0, settings_refresh_interval=60.0).items():
+                         command_timeout=20.0, settings_refresh_interval=60.0).items():
             setattr(cfg.server, k, v)
         cfg.topic_status = cfg.topic_settings = cfg.topic_port = "x"
         mgr = BLEManager(mac="AA:BB:CC:DD:EE:FF", token="aabbccddeeff",

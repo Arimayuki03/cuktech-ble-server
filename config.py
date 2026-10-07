@@ -63,7 +63,13 @@ class MQTTConfig:
 class ServerConfig:
     host: str = "0.0.0.0"
     port: int = field(default_factory=lambda: 18199 if sys.platform == "win32" else 8199)
-    command_timeout: float = 10.0
+    # 端口开关带一轮自动重试。单次 send_miot_command 的墙钟 = 响应 timeout
+    # (ble_manager._PORT_STEP_TIMEOUT=2s) + 发送握手（RCV_RDY/RCV_OK 各
+    # wait_notify(3.0)，正常 <1s）；两轮共 GET+SET 四步 + 间隔 ≈ 8.3s 正常、
+    # 20s 覆盖握手偏慢的情形。外层超时须大于重试总预算，否则 wait_for 会
+    # 在重试跑完前取消 future——UI 收到 timeout，而命令仍在后台写完并改
+    # 状态，又变成"UI 报错、设备已生效"。
+    command_timeout: float = 20.0
     settings_refresh_interval: float = 10.0
     log_level: str = "info"
     history_retention_days: int = 2
@@ -157,7 +163,7 @@ def load_config() -> Config:
     server = ServerConfig(
         host=server_cfg.get("host", "0.0.0.0"),
         port=int(os.environ.get("CUKTECH_SERVER_PORT", server_cfg.get("port", 18199 if sys.platform == "win32" else 8199))),
-        command_timeout=server_cfg.get("command_timeout", 10.0),
+        command_timeout=server_cfg.get("command_timeout", 20.0),
         settings_refresh_interval=server_cfg.get("settings_refresh_interval", 60.0),
         log_level=os.environ.get("CUKTECH_LOG_LEVEL", server_cfg.get("log_level", "info")),
         history_retention_days=history_retention,

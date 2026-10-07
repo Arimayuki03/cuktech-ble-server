@@ -63,6 +63,12 @@ class BLEManager:
     CIRCUIT_BREAKER_COOLDOWN = 300  # 5 minutes
     MAX_AUTH_FAILURES = 15  # consecutive auth failures before restarting process
     LIMIT_RETRY_SEC = 15    # 限额关断命令未生效的重试窗口（命令超时 10s）
+    # 端口开关读-改-写的单步响应超时与重试间隔。单次 send_miot_command 的
+    # 墙钟 = 本值 + 发送握手（RCV_RDY/RCV_OK 各 wait_notify(3.0)），编排
+    # 外层 command_timeout 时必须按含握手的口径算，否则重试会被外层超时
+    # 截断（UI 收到 timeout、后台仍写完 → "报错但设备已生效"）。
+    _PORT_STEP_TIMEOUT = 2.0
+    _PORT_RETRY_DELAY_S = 0.3
 
     def __init__(self, mac, token, state, config):
         self.mac = mac
@@ -1340,54 +1346,77 @@ class BLEManager:
                 cmd_future.set_result({"ok": False, "error": str(e)})
 
     async def _handle_port_command(self, cmd_data, cmd_future):
+        """端口开关：读 PIID16 基线 → 位运算 → SET 写回，失败自动重试一轮。
+
+        读-改-写的任一步都可能与 BLE 链路瞬时抖动撞车（send 失败/Result
+        迟到 → None、只回 ACK，或直接抛传输异常），单次尝试就报失败会
+        造成「UI 报错、设备实际已生效」——SET 多半已经写进去了，只是确认
+        帧丢了。因此失败（含抛异常）都重试一轮：重读基线天然自愈「已
+        生效未确认」——重读会看到目标位已翻转，本轮不再重复写。
+        重试仍失败才报 ok:False（此时"确实没生效"远多于"生效未确认"）。
+
+        超时预算（单次 send_miot_command 的墙钟 = 响应 timeout + 发送
+        握手最多 6s，见 controller.send_miot_command 文档串）：最坏两轮
+        ≈ 2×(2×(_PORT_STEP_TIMEOUT+6)) + 0.3，外层 command_timeout 须
+        大于它，否则 send_command 的 wait_for 会在第二轮跑完前取消
+        future——UI 收到 "command timeout"，而本协程仍在后台提交副作用，
+        又变成"UI 报错、设备已生效"。
+
+        已知残留风险：controller 的响应匹配只看 SIID/PIID，不校验序列号，
+        首轮迟到的 Result 理论上可能被重试轮当成基线。send_miot_command
+        开头的 _drain_pending_pushes 会清掉绝大多数迟到帧；彻底修需真机
+        确认设备是否可靠回显 seq 后再加校验（见 _port_write_once）。
+        """
         port, action = cmd_data
         try:
-            cur = await self.ctrl.send_miot_command(2, 16)
-            # GET 失败（链路瞬断/无响应）时绝不能以 0 为基线做读-改-写：
-            # 那会把其余正在充电的端口全部清零关断。宁可让本次命令失败。
-            if cur is None or cur.get("value") is None:
-                _LOGGER.warning("Port command %s %s: cannot read current port state, rejecting", port, action)
-                if cmd_future and not cmd_future.done():
-                    cmd_future.set_result({"ok": False, "error": "cannot read current port state"})
-                return
-            cur_val = cur["value"]
-            if port == "all":
-                new_val = 0x0F if action == "on" else 0x00
-            else:
-                bit = PORT_BITS[port]
-                new_val = cur_val | (1 << bit) if action == "on" else cur_val & ~(1 << bit)
-            if new_val != cur_val:
-                write_result = await self.ctrl.send_miot_command(2, 16, value=new_val)
-                # SET 写入失败（发送失败/无响应 → None）时绝不能继续：否则
-                # 缓存被写成设备实际未生效的值，还误报 ok:true、误关会话。
-                if write_result is None:
-                    _LOGGER.warning("Port command %s %s: write not confirmed, rejecting", port, action)
-                    if cmd_future and not cmd_future.done():
-                        cmd_future.set_result({"ok": False, "error": "port write not confirmed"})
+            initial_val = None      # 整条命令开始时设备上的位图（首轮基线）
+            result = None           # 最终 (new_val, wrote, baseline)
+            for attempt in (1, 2):
+                # 命令可能已在队列里等到调用方超时（send_command 的
+                # wait_for 从入队起计时，超时会 cancel future）：此时再写
+                # 设备会让调用方收到 "失败" 但设备稍后变化，直接跳过。
+                # 注意：只能拦住"轮次之间"的过期；若超时正好落在某一轮
+                # 执行中途，该轮仍会写完（与重试同因的残留风险，见下）。
+                if cmd_future is not None and (
+                        cmd_future.cancelled() or cmd_future.done()):
+                    _LOGGER.info("Port command %s %s: caller already gone, skipping",
+                                 port, action)
                     return
-                await self.state.update_settings({"16": new_val})
-                # Emit port state for all changed ports (SSE + MQTT)
-                if port == "all":
-                    for piid in range(1, 5):
-                        if not bool(new_val & (1 << (piid - 1))):
-                            if self._session_active(piid):
-                                self._close_session(piid, time.time(),
-                                                    reason=END_REASON_USER_OFF)
-                            await self.state.update_port(piid, PORT_DEFAULT)
-                        self._emit_port_state(piid)
-                else:
-                    piid = {"c1": 1, "c2": 2, "c3": 3, "a": 4}.get(port)
-                    if piid:
-                        if action == "off":
-                            if self._session_active(piid):
-                                # 用户手动关端口，或限额触发（_enforce_charge_limit
-                                # 入队的正是 ("port", (name,"off"))）——两者同路。
-                                self._close_session(piid, time.time(),
-                                                    reason=END_REASON_USER_OFF)
-                            await self.state.update_port(piid, PORT_DEFAULT)
-                        self._emit_port_state(piid)
-                _invalidate()
-            _invalidate()
+                try:
+                    outcome = await self._port_write_once(port, action)
+                except Exception as exc:
+                    # 传输层异常（GATT 写失败/解密等）等同本轮失败，
+                    # 进入重试；取消异常不是 Exception 子类，照常传播
+                    _LOGGER.warning("Port command %s %s: attempt %d raised: %s",
+                                    port, action, attempt, exc)
+                    outcome = None
+                if outcome is not None:
+                    # 首轮读到的基线即整条命令开始时设备上的真实位图；
+                    # 自愈路径（首轮 SET 已生效但未确认）下它不等于最终值，
+                    # 位图确实变了，副作用必须照常提交
+                    if initial_val is None:
+                        initial_val = outcome[2]
+                    if outcome[0] is not None:
+                        if attempt > 1:
+                            _LOGGER.info("Port command %s %s: succeeded on retry",
+                                         port, action)
+                        result = outcome
+                        break
+                if attempt == 1:
+                    # 首轮失败：短暂让链路喘息后重试
+                    await asyncio.sleep(self._PORT_RETRY_DELAY_S)
+            if result is None:
+                if cmd_future and not cmd_future.done():
+                    cmd_future.set_result({
+                        "ok": False, "error": "port command failed after retry"})
+                return
+            new_val, _wrote, _baseline = result
+            # 位图相对本条命令开始前确实变了才提交副作用。自愈路径下
+            # 本轮没写但首轮已生效（initial_val != new_val），同样要提交；
+            # 端口本就处于目标态时 initial_val == new_val，跳过——避免对
+            # 无变化的端口再关一次会话、再发一轮端口事件
+            if new_val != initial_val:
+                await self._commit_port_result(port, action, new_val)
             self._publish_settings(retain=True)
             if cmd_future and not cmd_future.done():
                 cmd_future.set_result({"ok": True, "value": new_val})
@@ -1395,6 +1424,70 @@ class BLEManager:
             _LOGGER.error("Port command error: %s", e)
             if cmd_future and not cmd_future.done():
                 cmd_future.set_result({"ok": False, "error": str(e)})
+
+    async def _port_write_once(self, port, action):
+        """执行一轮读-改-写，返回 (新位图, 本轮是否真的写了设备, 读到的基线)。
+
+        失败时新位图为 None，但基线照常带回（上层用它判断整条命令开始
+        前设备的真实位图）。不做任何副作用（缓存/会话/事件），交由上层
+        在确认成功后统一提交，保证重试路径下副作用恰好执行一次。
+
+        已知未覆盖：controller 的响应匹配只看 SIID/PIID，不校验序列号，
+        首轮迟到的 Result 理论上可能被重试轮当成基线。send_miot_command
+        开头的 _drain_pending_pushes 会清掉绝大多数迟到帧；彻底修需真机
+        确认设备是否可靠回显 seq 后再加校验。
+        """
+        cur = await self.ctrl.send_miot_command(2, 16, timeout=self._PORT_STEP_TIMEOUT)
+        # GET 失败（链路瞬断/无响应）时绝不能以 0 为基线做读-改-写：
+        # 那会把其余正在充电的端口全部清零关断。宁可让本次命令失败。
+        if cur is None or cur.get("value") is None:
+            _LOGGER.warning("Port command %s %s: cannot read current port state",
+                            port, action)
+            return None, False, None
+        cur_val = cur["value"]
+        if port == "all":
+            new_val = 0x0F if action == "on" else 0x00
+        else:
+            bit = PORT_BITS[port]
+            new_val = cur_val | (1 << bit) if action == "on" else cur_val & ~(1 << bit)
+        if new_val == cur_val:
+            # 基线已是目标态：多为上一轮 SET 已生效（重试自愈路径），
+            # 按成功确认但不重复写；是否提交副作用由上层比对首轮基线决定
+            return new_val, False, cur_val
+        write_result = await self.ctrl.send_miot_command(
+            2, 16, value=new_val, timeout=self._PORT_STEP_TIMEOUT)
+        # SET 写入失败（发送失败/无响应 → None）时绝不能继续：否则
+        # 缓存被写成设备实际未生效的值，还误报 ok:true、误关会话。
+        # 只回 ACK（value=None）同样不算确认：设备未承诺写成功。
+        if write_result is None or write_result.get("value") is None:
+            _LOGGER.warning("Port command %s %s: write not confirmed", port, action)
+            return None, False, cur_val
+        return new_val, True, cur_val
+
+    async def _commit_port_result(self, port, action, new_val):
+        """写确认成功后的副作用：更新缓存/关会话/发端口事件。只调用一次。"""
+        await self.state.update_settings({"16": new_val})
+        # Emit port state for all changed ports (SSE + MQTT)
+        if port == "all":
+            for piid in range(1, 5):
+                if not bool(new_val & (1 << (piid - 1))):
+                    if self._session_active(piid):
+                        self._close_session(piid, time.time(),
+                                            reason=END_REASON_USER_OFF)
+                    await self.state.update_port(piid, PORT_DEFAULT)
+                self._emit_port_state(piid)
+        else:
+            piid = {"c1": 1, "c2": 2, "c3": 3, "a": 4}.get(port)
+            if piid:
+                if action == "off":
+                    if self._session_active(piid):
+                        # 用户手动关端口，或限额触发（_enforce_charge_limit
+                        # 入队的正是 ("port", (name,"off"))）——两者同路。
+                        self._close_session(piid, time.time(),
+                                            reason=END_REASON_USER_OFF)
+                    await self.state.update_port(piid, PORT_DEFAULT)
+                self._emit_port_state(piid)
+        _invalidate()
 
     async def _handle_verify_port(self, cmd_data, cmd_future):
         """Actively GET a port's status rather than waiting for a BLE push.
