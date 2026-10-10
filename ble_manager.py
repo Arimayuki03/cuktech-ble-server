@@ -69,6 +69,7 @@ class BLEManager:
     # 截断（UI 收到 timeout、后台仍写完 → "报错但设备已生效"）。
     _PORT_STEP_TIMEOUT = 2.0
     _PORT_RETRY_DELAY_S = 0.3
+    _SEND_HANDSHAKE_OVERHEAD_S = 6.0  # 单次 send_miot_command 的发送握手上限
 
     def __init__(self, mac, token, state, config):
         self.mac = mac
@@ -1315,21 +1316,64 @@ class BLEManager:
     async def _handle_set_command(self, cmd_data, cmd_future):
         piid, value = cmd_data
         try:
-            result = await self.ctrl.send_miot_command(2, piid, value=value)
+            # 墙钟起点 = 首轮 SET 之前（调用方 wait_for 自入队起计，首轮
+            # SET 同样占用其预算，自愈重发把关须把它算进去）
+            cmd_started = time.monotonic()
+            # PIID 21 用短步超时：首轮 SET(2+6s 握手) + 读回(2+6s) 最坏
+            # 16s < 服务端 command_timeout(20s)，自愈确认必落在调用方等待
+            # 窗口内；其余 PIID 维持默认 8s 响应超时（原语义）
+            result = await self.ctrl.send_miot_command(
+                2, piid, value=value,
+                timeout=self._PORT_STEP_TIMEOUT if piid == 21 else None)
             # send_miot_command 发送失败/无响应返回 None（不抛异常）——
             # 此时不更新状态缓存、不报成功，否则 UI 假成功而设备未生效
             if result is None:
                 _LOGGER.warning("Set command piid=%s: no response (send failed or timeout)", piid)
-                if cmd_future and not cmd_future.done():
-                    cmd_future.set_result({"ok": False, "error": "no response from device"})
-                return
-            # ACK-only 响应（{'value': None, ...}）：设备确认收到但未回 Result
-            # （拒绝/超时），不能当成功写缓存，否则 UI 假成功而设备未生效。
-            if result.get("value") is None:
-                _LOGGER.warning("Set command piid=%s: ACK without Result, treating as failure", piid)
-                if cmd_future and not cmd_future.done():
-                    cmd_future.set_result({"ok": False, "error": "device acknowledged but did not confirm"})
-                return
+            elif result.get("value") is None:
+                _LOGGER.warning("Set command piid=%s: ACK without Result, verifying by read-back", piid)
+            if result is None or result.get("value") is None:
+                if piid == 21:
+                    # ACK/无响应 ≠ 设备未执行：SET 多半已写入，只是 Result
+                    # 确认帧丢失（同 _handle_port_command 的「UI 报错、设备
+                    # 实际已生效」）。PIID 21 可 GET 读回：验证已生效则按
+                    # 成功确认（自愈）；未生效才重发一轮，以最终读回为准。
+                    # 重发前按墙钟预算把关（实测起点为首轮 SET 前）：剩余
+                    # 预算跑不完「重发+确认」就不再重发，避免调用方已超时、
+                    # 后台仍写完——又回到"UI 报 timeout、设备已生效"。
+                    confirmed = await self._verify_protocol_write(value)
+                    if not confirmed:
+                        if cmd_future is not None and (
+                                cmd_future.cancelled() or cmd_future.done()):
+                            _LOGGER.info("Set command piid=21: caller already gone, skipping retry")
+                            return
+                        step_wall = (self._PORT_STEP_TIMEOUT
+                                     + self._SEND_HANDSHAKE_OVERHEAD_S)
+                        used = time.monotonic() - cmd_started
+                        budget = self.config.server.command_timeout - used
+                        if budget >= step_wall + self._PORT_RETRY_DELAY_S:
+                            await asyncio.sleep(self._PORT_RETRY_DELAY_S)
+                            retry = await self.ctrl.send_miot_command(
+                                2, piid, value=value,
+                                timeout=self._PORT_STEP_TIMEOUT)
+                            if retry is None or retry.get("value") is None:
+                                confirmed = await self._verify_protocol_write(value)
+                            else:
+                                confirmed = True
+                    if not confirmed:
+                        if cmd_future and not cmd_future.done():
+                            cmd_future.set_result(
+                                {"ok": False, "error": "device did not confirm write"})
+                        return
+                    _LOGGER.info("Set command piid=21: confirmed by read-back after unacknowledged SET")
+                    result = {"piid": piid, "value": value, "raw": None}
+                else:
+                    # 非 PIID 21：无响应/ACK-only 按失败处理（维持原语义）
+                    if cmd_future and not cmd_future.done():
+                        cmd_future.set_result({
+                            "ok": False,
+                            "error": ("no response from device" if result is None
+                                      else "device acknowledged but did not confirm")})
+                    return
             await self.state.update_settings({str(piid): value})
             # 同步协议扩展缓存，防止后续 toggle 读到过期值
             if piid == 21:
@@ -1344,6 +1388,23 @@ class BLEManager:
             _LOGGER.error("Set command error: %s", e)
             if cmd_future and not cmd_future.done():
                 cmd_future.set_result({"ok": False, "error": str(e)})
+
+    async def _verify_protocol_write(self, expected: int) -> bool:
+        """GET 读回 PIID 21，判断协议开关位图是否已是目标值。
+
+        用于 SET 只回 ACK/无响应时的「已生效未确认」自愈判定；GET 失败
+        一律按未确认处理（宁重发不假成功）。比较按 u32 位宽归一，容忍
+        设备回显单字节与四字节的宽度差异。
+        """
+        try:
+            cur = await self.ctrl.send_miot_command(
+                2, 21, timeout=self._PORT_STEP_TIMEOUT)
+        except Exception as e:
+            _LOGGER.warning("Protocol write verify: read-back failed: %s", e)
+            return False
+        if cur is None or cur.get("value") is None:
+            return False
+        return (int(cur["value"]) & 0xFFFFFFFF) == (int(expected) & 0xFFFFFFFF)
 
     async def _handle_port_command(self, cmd_data, cmd_future):
         """端口开关：读 PIID16 基线 → 位运算 → SET 写回，失败自动重试一轮。

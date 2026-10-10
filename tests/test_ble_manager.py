@@ -225,6 +225,137 @@ class TestProcessCommands:
         assert mgr.state.settings.get("5") != 1
 
     @pytest.mark.asyncio
+    async def test_process_set_command_piid21_ack_only_self_heals(self):
+        """PIID 21 SET 只回 ACK（Result 丢失）：读回已生效 → 报成功并写缓存。
+
+        「UI 报错、设备实际已生效」的主修复路径：协议开关位图（PIID 21）
+        可 GET 读回，SET 未确认时以读回为准，不再把 ACK-only 一律当失败。
+        """
+        mgr = make_manager()
+        mgr.ctrl = MagicMock()
+        target = 0x080A0808
+
+        def send_miot_command(siid, piid, value=None, timeout=None):
+            if value is not None:
+                return {"piid": 21, "value": None, "raw": None}  # SET 只回 ACK
+            return {"piid": 21, "value": target, "raw": None}    # 读回已生效
+
+        mgr.ctrl.send_miot_command = AsyncMock(side_effect=send_miot_command)
+
+        future = asyncio.get_running_loop().create_future()
+        await mgr.cmd_queue.put(("set", (21, target), future))
+
+        await mgr._process_commands()
+
+        assert future.done()
+        assert future.result() == {"ok": True}
+        assert mgr.state.protocol_extend == target
+        assert mgr.state.settings.get("21") == target
+
+    @pytest.mark.asyncio
+    async def test_process_set_command_piid21_retry_then_confirmed(self):
+        """PIID 21 SET 无响应且读回未生效：重发一轮，重发确认 → 报成功。"""
+        mgr = make_manager()
+        mgr.ctrl = MagicMock()
+        target = 0x080A0808
+        calls = {"n": 0}
+
+        def send_miot_command(siid, piid, value=None, timeout=None):
+            calls["n"] += 1
+            if calls["n"] == 1:
+                return None  # 首轮 SET 完全无响应
+            if value is None:
+                return {"piid": 21, "value": 0, "raw": None}      # 读回：旧值
+            return {"piid": 21, "value": target, "raw": None}     # 重试 SET 确认
+
+        mgr.ctrl.send_miot_command = AsyncMock(side_effect=send_miot_command)
+
+        future = asyncio.get_running_loop().create_future()
+        await mgr.cmd_queue.put(("set", (21, target), future))
+
+        await mgr._process_commands()
+
+        assert future.done()
+        assert future.result() == {"ok": True}
+        assert mgr.state.protocol_extend == target
+        assert calls["n"] == 3  # SET + 读回 + 重试 SET
+
+    @pytest.mark.asyncio
+    async def test_process_set_command_piid21_read_back_confirms_after_failed_retry(self):
+        """两轮 SET 均未确认但设备实际已写入：第二次读回确认 → 报成功（自愈）。"""
+        mgr = make_manager()
+        mgr.ctrl = MagicMock()
+        target = 0x080A0808
+        calls = {"n": 0}
+
+        def send_miot_command(siid, piid, value=None, timeout=None):
+            calls["n"] += 1
+            if value is None:  # GET 读回
+                return {"piid": 21, "value": target if calls["n"] == 4 else 0,
+                        "raw": None}
+            return None        # 两轮 SET 都无响应（设备实际已写入）
+
+        mgr.ctrl.send_miot_command = AsyncMock(side_effect=send_miot_command)
+
+        future = asyncio.get_running_loop().create_future()
+        await mgr.cmd_queue.put(("set", (21, target), future))
+
+        await mgr._process_commands()
+
+        assert future.done()
+        assert future.result() == {"ok": True}
+        assert mgr.state.protocol_extend == target
+
+    @pytest.mark.asyncio
+    async def test_process_set_command_piid21_really_fails(self):
+        """两轮 SET 未确认且读回始终旧值：报 ok:False，缓存不得污染。"""
+        mgr = make_manager()
+        mgr.ctrl = MagicMock()
+        target = 0x080A0808
+
+        def send_miot_command(siid, piid, value=None, timeout=None):
+            if value is None:
+                return {"piid": 21, "value": 0, "raw": None}  # 读回永远是旧值
+            return None                                       # SET 始终未确认
+
+        mgr.ctrl.send_miot_command = AsyncMock(side_effect=send_miot_command)
+
+        future = asyncio.get_running_loop().create_future()
+        await mgr.cmd_queue.put(("set", (21, target), future))
+
+        await mgr._process_commands()
+
+        assert future.done()
+        result = future.result()
+        assert result["ok"] is False
+        assert result["error"] == "device did not confirm write"
+        assert mgr.state.protocol_extend == 0
+        assert mgr.state.settings.get("21") != target
+
+    @pytest.mark.asyncio
+    async def test_process_set_command_piid21_caller_gone_skips_retry(self):
+        """调用方（send_command 的 wait_for）已超时取消 future：不再重发。"""
+        mgr = make_manager()
+        mgr.ctrl = MagicMock()
+
+        def send_miot_command(siid, piid, value=None, timeout=None):
+            if value is None:
+                return {"piid": 21, "value": 0, "raw": None}  # 读回：旧值
+            return {"piid": 21, "value": None, "raw": None}   # SET 只回 ACK
+
+        mgr.ctrl.send_miot_command = AsyncMock(side_effect=send_miot_command)
+
+        future = asyncio.get_running_loop().create_future()
+        assert future.cancel()
+        await mgr.cmd_queue.put(("set", (21, 0x080A0808), future))
+
+        await mgr._process_commands()
+
+        # SET + 读回各一次；读回未确认且调用方已走 → 跳过重试直接返回
+        assert mgr.ctrl.send_miot_command.await_count == 2
+        assert mgr.state.protocol_extend == 0
+
+    @pytest.mark.asyncio
     async def test_process_port_command_write_unconfirmed(self):
         """port SET 写入两轮均未确认 → 报 ok:False，缓存/会话副作用不执行。"""
         mgr = make_manager()
