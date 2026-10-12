@@ -1310,8 +1310,10 @@ class BLEManager:
             "Auth failed %d times consecutively. "
             "Restarting process to recover BLE session.",
             self._auth_fail_count)
-        self._publish_status(
-            {"connected": False, "error": "auth_stuck_restarting"}, retain=True)
+        payload = self._status_payload()
+        payload.update(connected=False, authenticated=False,
+                       error="auth_stuck_restarting")
+        self._publish_status(payload, retain=True)
         # 给 MQTT/SSE 一点时间把上面这条状态发出去，再重启
         await asyncio.sleep(self.AUTH_STUCK_NOTIFY_SEC)
         if self._restart_handler is not None:
@@ -1420,7 +1422,10 @@ class BLEManager:
                             "Device session is stuck. Please power-cycle the charger "
                             "(unplug and replug) to reset its BLE session.",
                             self._auth_fail_count)
-                        self._publish_status({"connected": False, "error": "device_session_stuck"}, retain=True)
+                        payload = self._status_payload()
+                        payload.update(connected=False, authenticated=False,
+                                       error="device_session_stuck")
+                        self._publish_status(payload, retain=True)
                         # 等待 10 分钟后自动重试（给设备足够时间清除 BLE 会话）
                         delay = self._auth_backoff_delay(self._auth_fail_count)
                     else:
@@ -1560,7 +1565,7 @@ class BLEManager:
         _LOGGER.info("Authenticated!")
 
         # 立即推送连接状态，前端无需等待 15 个 PIID 读完
-        self._publish_status({"connected": True, "authenticated": True}, retain=True)
+        self._publish_status(self._status_payload(), retain=True)
 
         # 先读取 PIID 17 (c1_c2_protocol) 获取硬件协议代码
         # 再处理 init_push 端口数据，确保 hw_protocol 已就绪
@@ -1574,23 +1579,7 @@ class BLEManager:
             self.ctrl.init_push_frames = []
 
         # Build full state for status event
-        ports_data = {}
-        port_ctl = self.state.settings.get("16", 0x0F)
-        for piid, pname in PORT_NAMES.items():
-            ps = self.state.ports.get(piid)
-            port_data = ps.to_dict() if ps else dict(PORT_DEFAULT)
-            port_data["enabled"] = bool(port_ctl & (1 << (piid - 1)))
-            ports_data[str(piid)] = port_data
-        self._publish_status({
-            "connected": True,
-            "authenticated": True,
-            "device_model": self.ctrl.device_model,
-            "firmware_version": self.ctrl.firmware_version,
-            "ports": ports_data,
-            "settings": self.state.settings,
-            "protocol_switches": self.state.protocol_switches,
-            "protocol_extend": self.state.protocol_extend,
-        }, retain=True)
+        self._publish_status(self._status_payload(), retain=True)
 
         await asyncio.sleep(2)
 
@@ -1625,11 +1614,7 @@ class BLEManager:
                 _LOGGER.error("BLE device disconnected unexpectedly")
         await self.state.set_connection(False, False)
         _invalidate()
-        self._publish_status({
-            "connected": False,
-            "device_model": self.state.device_model,
-            "firmware_version": self.state.firmware_version,
-        }, retain=True)
+        self._publish_status(self._status_payload(), retain=True)
         # bluetoothctl disconnect MAC 由 _force_disconnect_bluetooth() 统一处理
         # 此处不再重复调用，避免设备收到多次断连通知导致状态混乱
 
@@ -2003,7 +1988,11 @@ class BLEManager:
     async def _read_initial_settings(self):
         await self._fetch_settings(update_existing=False)
         for piid, pname in PORT_NAMES.items():
-            self._publish_port(pname, PORT_DEFAULT, retain=True)
+            # 端口载荷必须始终带 enabled：HA 开关模板取 value_json.enabled，
+            # 缺失会被打成 unknown，且保留消息会一直带着这个坏载荷。
+            data = dict(PORT_DEFAULT)
+            data["enabled"] = self._port_enabled(piid)
+            self._publish_port(pname, data, retain=True)
 
     async def _refresh_settings(self):
         await self._fetch_settings(update_existing=True)
@@ -2556,6 +2545,50 @@ class BLEManager:
         if pt is None:
             return
         await self._process_decrypted_frame(pt)
+
+    def _status_payload(self) -> dict:
+        """完整状态载荷。
+
+        键集合与 /api/status 一致：HA 的 value_template 依赖 ports/firmware_version
+        等键始终存在，字段缺失会把实体打成 unknown。
+        """
+        port_ctl = self.state.settings.get("16", 0x0F)
+        ports_data = {}
+        for piid in PORT_NAMES:
+            ps = self.state.ports.get(piid)
+            data = ps.to_dict() if ps else dict(PORT_DEFAULT)
+            data["enabled"] = bool(port_ctl & (1 << (piid - 1)))
+            ports_data[str(piid)] = data
+        return {
+            "connected": self.state.connected,
+            "authenticated": self.state.authenticated,
+            "device_model": self.state.device_model,
+            "firmware_version": self.state.firmware_version,
+            "ports": ports_data,
+            "settings": dict(self.state.settings),
+            "protocol_switches": self.state.protocol_switches,
+            "protocol_extend": self.state.protocol_extend,
+        }
+
+    def republish_retained_state(self):
+        """MQTT（重）连后重发 retained 状态。
+
+        链路意外断开时 broker 会用 will（{"connected": false}）覆盖 status 的
+        retained，而服务端只在 BLE 认证/断开时发布完整状态；不补发的话，HA 会
+        在下次 BLE 认证前一直显示离线。本方法从当前 state 直接组包；由 paho
+        回调线程调用，因此不经 SSE。
+        """
+        if not self._mqtt_publish:
+            return
+        self._mqtt_publish(self.config.topic_status, self._status_payload(), retain=True)
+        for piid, pname in PORT_NAMES.items():
+            ps = self.state.ports.get(piid)
+            data = ps.to_dict() if ps else dict(PORT_DEFAULT)
+            data["enabled"] = self._port_enabled(piid)
+            self._mqtt_publish(f"{self.config.topic_port}/{pname}", data, retain=True)
+        if self.state.settings:
+            self._mqtt_publish(self.config.topic_settings, dict(self.state.settings), retain=True)
+        _LOGGER.info("Republished retained MQTT state after (re)connect")
 
     def _publish_status(self, payload, retain=False):
         if self._mqtt_publish:

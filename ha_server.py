@@ -413,6 +413,13 @@ class Server:
             if s.ble:
                 s.ble.set_mqtt_publisher(s.mqtt_publish)
             s.setup_mqtt_subscriptions()
+            if s.ble:
+                # 断链期间 broker 可能已用 will 脏化 retained，重连后立即补发纠正
+                # （paho 回调线程：发布失败要吞掉，不能拖垮回调）
+                try:
+                    s.ble.republish_retained_state()
+                except Exception as exc:
+                    _LOGGER.warning("Republish retained state failed: %s", exc)
 
         def on_disconnect(client, userdata, flags, rc, properties=None):
             _LOGGER.warning("MQTT disconnected (rc=%s)", rc)
@@ -707,9 +714,15 @@ class Server:
             for piid in range(1, 5):
                 await self.state.update_port(piid, PORT_DEFAULT)
             if self.mqtt_client and self.mqtt_client.is_connected():
+                port_ctl = self.state.settings.get("16", 0x0F)
                 for piid, pname in PORT_NAMES.items():
-                    self.mqtt_publish(f"{self.config.topic_port}/{pname}", PORT_DEFAULT)
-                self.mqtt_publish(self.config.topic_status, {"connected": False}, retain=True)
+                    # enabled 必须保留：HA 开关模板取 value_json.enabled，缺失即 unknown
+                    data = dict(PORT_DEFAULT)
+                    data["enabled"] = bool(port_ctl & (1 << (piid - 1)))
+                    self.mqtt_publish(f"{self.config.topic_port}/{pname}", data)
+                payload = dict(await self.state.to_dict())
+                payload["connected"] = False
+                self.mqtt_publish(self.config.topic_status, payload, retain=True)
             else:
                 _LOGGER.warning("MQTT not connected, port data not cleared via MQTT")
         self.invalidate_status_cache()
