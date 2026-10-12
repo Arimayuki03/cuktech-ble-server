@@ -6,3 +6,4 @@ __pycache__/
 
 # Local configuration (contains BLE token / keys)
 config.yaml
+.mimosa/
