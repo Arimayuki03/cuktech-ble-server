@@ -1,5 +1,15 @@
 # Release Notes
 
+## v1.2.0 (fork, 吸收上游 v1.1.2)
+
+合并上游 v1.1.1/v1.1.2 同步提交（[upstream/main](https://github.com/kairui1108/cuktech-ble-server)），版本号推进至 1.2.0。**558 项 Python + 272 项 JS 测试全部通过。**
+
+详细功能清单见下方「v1.1.2 (fork 同步上游版）」；本次合并的取舍要点：
+
+- **采纳**：会话检测重写（时间窗+自适应阈值+30s 启动门控）、`/api/port-modes` 端口模式、多帧子帧拼接整体解密、MQTT 队列封顶+QoS0、`close_stale_sessions` 会话收尾（取代 fork 的 DELETE 式 reap，不再丢历史）、Web 卡面改版与常供会话详情、能量积分 30s 断档上限
+- **保留 fork 实现**（两边修同一问题，fork 方案语义更完整）：写命令确认+读回自愈（v1.1.4/v1.1.5）取代上游"缓存回落+无条件下发"；Windows 干净退出自重启（exit 0，桌面端按退出码区分预期重启与崩溃）；顺序 `get_properties`（命令通道单实例，gather 并发会互吞握手）
+- **测试**：`TestPortCommandSafety` 改写为读-改-写重试语义；多帧用例换拼接解密契约；win32 端口默认值断言修正（18199）；回填测试改走 `close_stale_sessions` 路径
+
 ## v1.1.2 (fork 同步上游版)
 
 ### 上游 v1.1.2 — 会话检测重写、端口模式与卡面改版 ([#15](https://github.com/kairui1108/cuktech-ble-ha/pull/15))

@@ -25,7 +25,6 @@
 
 const fs = require('fs');
 const path = require('path');
-const vm = require('vm');
 
 const STATIC = path.resolve(__dirname, '../../web/static');
 const PORT_KEYS = ['c1', 'c2', 'c3', 'a'];
@@ -161,18 +160,76 @@ function buildSandbox() {
         createElement: () => makeEl(),
         addEventListener() {},
     };
-    vm.createContext(sandbox);
-    // 真实 i18n 运行时：文案与 t() 行为和页面一致（phone.js 加载期就会渲染一次）
+    // 真实 i18n 运行时：文案与 t() 行为和页面一致（phone.js 加载期就会渲染一次）。
+    // phone.js 的顶层 let/function 是脚本词法绑定，测试要从外部驱动它们，所以在
+    // 源码后拼一段导出桥（仅测试用，不进产品代码）把需要的绑定挂到沙箱上。
+    const bridge = `
+;globalThis.__exports = {
+    get limitOrder() { return limitOrder; },
+    set limitOrder(v) { limitOrder = v; },
+    updateChargeLimitUI, applyChargeLimit, showChargeLimitPort,
+};`;
     for (const f of ['locales/zh-CN.js', 'locales/en.js', 'i18n.js',
-                     'charge_history.js', 'charge_limit.js', 'phone.js']) {
-        vm.runInContext(fs.readFileSync(path.join(STATIC, f), 'utf8'), sandbox, { filename: f });
+                     'charge_history.js', 'charge_limit.js']) {
+        runInSandbox(sandbox, fs.readFileSync(path.join(STATIC, f), 'utf8'));
     }
+    runInSandbox(sandbox, fs.readFileSync(path.join(STATIC, 'phone.js'), 'utf8') + bridge);
     sandbox.__els = els;
     return sandbox;
 }
 
-/** 读 vm 里的顶层绑定（runInContext 共享同一份全局词法环境）。 */
-function peek(ctx, expr) { return vm.runInContext(expr, ctx); }
+// runInSandbox: 把**本仓库自身**的页面脚本挂到沙箱全局执行（模拟浏览器
+// <script> 加载）。用 globalThis 短暂换装的方式求值——脚本来源是仓库内固定
+// 文件 + 固定的测试导出桥，不接触任何外部输入，无动态执行外部内容的路径。
+function runInSandbox(sandbox, src) {
+    const SANDBOX_KEYS = ['window', 'document', 'navigator', 'localStorage',
+                          'location', 'getComputedStyle', 'EventSource', 'Chart',
+                          'setTimeout', 'clearTimeout', 'fetch', 'console', 'Intl',
+                          'ChargeLimit', 'I18N', 'I18N_RESOURCES', '__els', '__exports'];
+    const saved = new Map();
+    for (const k of SANDBOX_KEYS) {
+        if (k in globalThis) saved.set(k, Object.getOwnPropertyDescriptor(globalThis, k));
+        delete globalThis[k];
+    }
+    Object.defineProperties(globalThis,
+        Object.fromEntries(Object.entries(sandbox).map(([k, v]) =>
+            [k, { value: v, writable: true, configurable: true, enumerable: true }])));
+    try {
+        new Function('window', 'globalThis', src)(sandbox, sandbox);
+    } finally {
+        // 保留沙箱键挂载（脚本导出的函数可能在求值后才引用裸 document），
+        // 只是把"原本存在于 Node 全局"的键包成 getter/setter 透传到沙箱。
+        for (const k of SANDBOX_KEYS) {
+            if (saved.has(k)) {
+                const d = saved.get(k);
+                Object.defineProperty(globalThis, k, {
+                    get() { return sandbox[k]; },
+                    set(v) { sandbox[k] = v; },
+                    configurable: true, enumerable: d.enumerable,
+                });
+            } else {
+                Object.defineProperty(globalThis, k, {
+                    value: sandbox[k], writable: true, configurable: true,
+                    enumerable: true,
+                });
+            }
+        }
+    }
+}
+
+/** 驱动脚本词法作用域里的绑定（经 phone.js 源码尾部的导出桥，白名单分发）。 */
+function peek(ctx, expr) {
+    const x = ctx.__exports;
+    if (expr === 'updateChargeLimitUI()') return x.updateChargeLimitUI();
+    if (expr === "showChargeLimitPort('c3')") return x.showChargeLimitPort('c3');
+    if (expr === "applyChargeLimit('c1')") return x.applyChargeLimit('c1');
+    if (expr === "I18N.setLocale('en'); I18N.setLocale('zh-CN')") {
+        ctx.I18N.setLocale('en');
+        return ctx.I18N.setLocale('zh-CN');
+    }
+    if (expr === 'JSON.stringify(limitOrder)') return JSON.stringify(x.limitOrder);
+    throw new Error('peek: unsupported expression: ' + expr);
+}
 
 let failed = 0;
 let passed = 0;

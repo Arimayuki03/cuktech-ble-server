@@ -37,8 +37,10 @@
 - **HTTP API**：提供 RESTful 接口供外部系统调用
 - **MQTT LWT**：崩溃时自动通知 HA 设备离线
 - **巴法云 (Bemfa) 接入**：支持小爱同学/小度音箱语音控制充电器端口
-- **充电记录与电量统计**：自动记录充电会话（起止时间、电量、峰值功率），Web UI 查看历史详情
-- **电量积分 (Wh)**：基于梯形积分实时累积端口充电能量
+- **充电记录与电量统计**：自动记录充电会话（起止时间、电量、峰值功率、均压均流按采样点时间加权），Web UI 查看历史详情；崩溃遗留会话重启后按采样点自动收尾，不丢历史
+- **端口模式**：长期供电（不切断端口，曲线留内存 1 小时）与充满即停（`once`/`always`），与 Wh 限额互斥，即时生效无需重启
+- **会话智能判定**：按秒时间窗 + 自适应阈值 + 30s 启动门控，5V 涓流尾巴能判满，瞬时零电流不再切碎会话；拔出/空载/关端口分别归类
+- **电量积分 (Wh)**：基于梯形积分实时累积端口充电能量，30s 采样断档不计费（闲置空档不凭空虚增）
 - **充电量限额**：为每个端口设置"充到指定 Wh 自动关断"（`once` 一次性 / `always` 长期有效），index/phone 页卡片直接设置
 - **SQLite 历史数据**：端口数据持久化存储，支持统计和导出
 - **BLE 连接质量评估**：实时评分（0-100），包含解密率、通知响应、连接稳定性等指标
@@ -219,6 +221,26 @@ docker compose up -d
 | `/api/energy/stats` | GET | 能量统计（按周期汇总，含 `by_port` 分端口明细） |
 | `/api/energy/protocols` | GET | 按充电协议聚合的电量与次数（Web"用电统计 → 快充协议"视图；服务端 GROUP BY，避免前端翻页拼不全） |
 | `/api/charge-limits` | GET/POST | 充电量限额（充到指定 Wh 自动关断端口） |
+| `/api/port-modes` | GET/POST | 端口模式：长期供电（`permanent`，不切断、曲线留内存 1h）与充满即停（`full_off`，once/always）；与 Wh 限额互斥 |
+
+### 端口模式
+
+每个端口二选一（与充电量限额互斥）：
+
+- **长期供电（permanent）**：不自动切断，供挂载/常载设备；曲线点不落库，仅在内存保留最近 1 小时供详情浮层查看
+- **充满即停（full_off）**：会话被自动判定结束后关闭端口，`once`（仅下次）/`always`（每次）两种生效方式
+
+```bash
+# C1 设为长期供电
+curl -X POST http://localhost:8199/api/port-modes \
+  -H 'Content-Type: application/json' \
+  -d '{"port":"c1","permanent":true}'
+
+# C2 设为充满即停（每次充电生效）
+curl -X POST http://localhost:8199/api/port-modes \
+  -H 'Content-Type: application/json' \
+  -d '{"port":"c2","full_off":true,"mode":"always"}'
+```
 
 ### 充电量限额
 

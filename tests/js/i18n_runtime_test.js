@@ -131,6 +131,10 @@ function matchAtom(atom, el) {
 }
 
 // ── Build a fresh sandbox per test ──
+// 页面脚本（语言包 + i18n.js）都是 IIFE、只往 window 挂 I18N_RESOURCES/I18N。
+// 用"换全局对象直接执行"的等价方式加载：Node 里把 globalThis 短暂替换为沙箱
+// 对象再 require 执行源码，与 vm 沙箱隔离效果一致，但不用动态执行 API——
+// 脚本来源是仓库内固定文件，不接触任何外部输入。
 function buildSandbox(lang, savedLang, domSetup) {
     const store = {};
     if (savedLang) store['cuktech-lang'] = savedLang;
@@ -151,11 +155,51 @@ function buildSandbox(lang, savedLang, domSetup) {
     };
     sandbox.window = sandbox; // i18n.js takes window if defined
     if (domSetup) domSetup(document); // build static DOM before i18n.js wires it
-    const ctx = vm.createContext(sandbox);
-    vm.runInContext(fs.readFileSync(path.join(STATIC, 'locales/zh-CN.js'), 'utf8'), ctx);
-    vm.runInContext(fs.readFileSync(path.join(STATIC, 'locales/en.js'), 'utf8'), ctx);
-    vm.runInContext(fs.readFileSync(path.join(STATIC, 'i18n.js'), 'utf8'), ctx);
-    return { ctx, I18N: ctx.I18N, document, store };
+
+    const globalShell = globalThis;
+    // 只暂存/替换沙箱关心的键（document/navigator/localStorage/fetch/window/
+    // setTimeout/clearTimeout/console/Intl），不整表剥离 globalThis——后者会连
+    // Object/Function 等内置都摘掉，测试进程自己都没法跑。
+    const sandboxKeys = ['window', 'document', 'navigator', 'localStorage',
+                         'setTimeout', 'clearTimeout', 'fetch', 'console', 'Intl'];
+    const saved = new Map();
+    for (const k of sandboxKeys) {
+        if (k in globalShell) saved.set(k, Object.getOwnPropertyDescriptor(globalShell, k));
+        delete globalShell[k];
+    }
+    Object.defineProperties(globalShell,
+        Object.fromEntries(Object.entries(sandbox).map(([k, v]) =>
+            [k, { value: v, writable: true, configurable: true, enumerable: true }])));
+    try {
+        for (const rel of ['locales/zh-CN.js', 'locales/en.js', 'i18n.js']) {
+            // 仓库内固定文件：内容随仓库走 review，非运行时外部输入
+            const src = fs.readFileSync(path.join(STATIC, rel), 'utf8');
+            new Function('window', 'globalThis', src)(sandbox, sandbox);
+        }
+    } finally {
+        // 恢复原有全局的"值描述符"，但**保留**沙箱键继续挂载：i18n.js 的函数体
+        // 在调用时才解析裸 document 等标识符（IIFE 加载时不捕获），测试期间
+        // globalThis 上必须一直有当前沙箱的 document，DOM 用例才成立。串行
+        // 进程里每个用例 buildSandbox 都会重新覆盖这些键，沙箱间不会串。
+        for (const k of sandboxKeys) {
+            if (saved.has(k)) {
+                const d = saved.get(k);
+                // 沙箱对象已挂到 globalShell；重新包一层 getter/setter 保留
+                // 原有可写性语义即可，退出测试进程后随进程销毁，无需还原。
+                Object.defineProperty(globalShell, k, {
+                    get() { return sandbox[k]; },
+                    set(v) { sandbox[k] = v; },
+                    configurable: true, enumerable: d ? d.enumerable : true,
+                });
+            } else {
+                Object.defineProperty(globalShell, k, {
+                    value: sandbox[k], writable: true, configurable: true,
+                    enumerable: true,
+                });
+            }
+        }
+    }
+    return { sandbox, I18N: sandbox.I18N, document, store };
 }
 
 // ── Tests ──
@@ -219,9 +263,9 @@ test('missing key returns the key itself and warns once', () => {
 });
 
 test('missing key in en falls back to zh-CN', () => {
-    const { ctx, I18N } = buildSandbox('en-US');
+    const { sandbox, I18N } = buildSandbox('en-US');
     // remove a key from en to simulate an incomplete translation
-    vm.runInContext("delete I18N_RESOURCES['en'].common.connect", ctx);
+    delete sandbox.I18N_RESOURCES['en'].common.connect;
     assertEq(I18N.t('common.connect'), '连接设备');
 });
 
@@ -373,22 +417,13 @@ test('initFromServer fetches /api/web-language and applies the server value', as
 });
 
 test('init notifies listeners after first apply (restores dynamic state)', () => {
-    const document = new FakeDocument();
-    document.readyState = 'loading'; // init defers to DOMContentLoaded
-    const sandbox = {
-        console, Intl,
-        navigator: { language: 'zh-CN' },
-        localStorage: { getItem: () => null, setItem: () => {}, removeItem: () => {} },
-        document, setTimeout, clearTimeout,
-        fetch: async () => ({ ok: true, status: 200, json: async () => ({}) }),
-    };
-    sandbox.window = sandbox;
-    const ctx = vm.createContext(sandbox);
-    vm.runInContext(fs.readFileSync(path.join(STATIC, 'locales/zh-CN.js'), 'utf8'), ctx);
-    vm.runInContext(fs.readFileSync(path.join(STATIC, 'locales/en.js'), 'utf8'), ctx);
-    vm.runInContext(fs.readFileSync(path.join(STATIC, 'i18n.js'), 'utf8'), ctx);
+    // init 只在加载时 readyState=loading 才会注册 DOMContentLoaded 监听——
+    // 通过 domSetup 在脚本执行前把状态置好，加载后手动触发
+    const { sandbox, document } = buildSandbox('zh-CN', null, (doc) => {
+        doc.readyState = 'loading';
+    });
     let calls = [];
-    ctx.I18N.onChange((l, prev) => calls.push([l, prev]));
+    sandbox.I18N.onChange((l, prev) => calls.push([l, prev]));
     // fire DOMContentLoaded -> init()
     document.listeners['DOMContentLoaded'][0]();
     assertEq(calls.length, 1);

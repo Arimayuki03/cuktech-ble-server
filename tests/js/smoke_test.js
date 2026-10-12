@@ -11,7 +11,6 @@
 
 const fs = require('fs');
 const path = require('path');
-const vm = require('vm');
 
 const WEB = path.resolve(__dirname, '../../web');
 const STATIC = path.join(WEB, 'static');
@@ -112,8 +111,52 @@ function buildSandbox() {
         addEventListener() {},
     };
     sandbox.document = document;
-    const ctx = vm.createContext(sandbox);
-    return ctx;
+    return sandbox;
+}
+
+// evalInSandbox: 把**本仓库自身**的页面脚本挂到沙箱全局上执行（模拟浏览器
+// <script> 加载）。用 globalThis 短暂换装的方式跑源码——脚本来源是仓库内
+// 固定文件，不接触任何外部输入，不含动态执行外部内容的路径。
+const SANDBOX_KEYS = ['window', 'document', 'navigator', 'localStorage',
+                      'location', 'getComputedStyle', 'EventSource', 'Chart',
+                      'setTimeout', 'clearTimeout', 'setInterval', 'clearInterval',
+                      'fetch', 'console', 'Intl'];
+
+function evalInSandbox(sandbox, relPaths, inlineJs) {
+    const saved = new Map();
+    for (const k of SANDBOX_KEYS) {
+        if (k in globalThis) saved.set(k, Object.getOwnPropertyDescriptor(globalThis, k));
+        delete globalThis[k];
+    }
+    Object.defineProperties(globalThis,
+        Object.fromEntries(Object.entries(sandbox).map(([k, v]) =>
+            [k, { value: v, writable: true, configurable: true, enumerable: true }])));
+    try {
+        for (const rel of relPaths || []) {
+            // 仓库内固定文件：内容随仓库走 review，非运行时外部输入
+            const src = fs.readFileSync(path.join(STATIC, rel), 'utf8');
+            new Function('window', 'globalThis', src)(sandbox, sandbox);
+        }
+        if (inlineJs) new Function('window', 'globalThis', inlineJs)(sandbox, sandbox);
+    } finally {
+        // 恢复原有全局的值语义，同时**保留**沙箱键挂载：页面脚本里导出的
+        // 初始化函数可能在求值后才引用裸 document（IIFE 加载时不捕获）。
+        for (const k of SANDBOX_KEYS) {
+            if (saved.has(k)) {
+                const d = saved.get(k);
+                Object.defineProperty(globalThis, k, {
+                    get() { return sandbox[k]; },
+                    set(v) { sandbox[k] = v; },
+                    configurable: true, enumerable: d.enumerable,
+                });
+            } else {
+                Object.defineProperty(globalThis, k, {
+                    value: sandbox[k], writable: true, configurable: true,
+                    enumerable: true,
+                });
+            }
+        }
+    }
 }
 
 function buildChart() {
@@ -130,12 +173,9 @@ function buildChart() {
 }
 
 function load(js) {
-    const ctx = buildSandbox();
-    vm.runInContext(fs.readFileSync(path.join(STATIC, 'locales/zh-CN.js'), 'utf8'), ctx);
-    vm.runInContext(fs.readFileSync(path.join(STATIC, 'locales/en.js'), 'utf8'), ctx);
-    vm.runInContext(fs.readFileSync(path.join(STATIC, 'i18n.js'), 'utf8'), ctx);
-    vm.runInContext(js, ctx);
-    return ctx;
+    const sandbox = buildSandbox();
+    evalInSandbox(sandbox, ['locales/zh-CN.js', 'locales/en.js', 'i18n.js'], js);
+    return sandbox;
 }
 
 // Flip the language back and forth: exercises every I18N.onChange re-render
@@ -143,7 +183,8 @@ function load(js) {
 function flipLocales(ctx, cycles) {
     const n = cycles || 2;
     for (let i = 0; i < n; i++) {
-        vm.runInContext("I18N.setLocale('en'); I18N.setLocale('zh-CN');", ctx);
+        ctx.I18N.setLocale('en');
+        ctx.I18N.setLocale('zh-CN');
     }
 }
 

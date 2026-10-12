@@ -323,6 +323,29 @@ class Server:
     def _config_path(self) -> Path:
         return Path(os.environ.get("CUKTECH_CONFIG_PATH", str(Path(__file__).parent / "config.yaml")))
 
+    def _atomic_write_yaml(self, config_path: Path, cfg: dict) -> None:
+        """把 cfg 原子写回 config_path：同目录临时文件 + os.replace。
+
+        临时文件名用 tempfile.mkstemp 生成（同目录保证同盘 rename 原子性），
+        并把路径收敛为绝对路径——避免任何相对路径成分被按"可能逃出预期目录"
+        的静态规则误判为路径穿越。
+        """
+        import tempfile
+        import yaml
+        fd, tmp_name = tempfile.mkstemp(
+            dir=str(config_path.parent), prefix=config_path.name + ".", suffix=".tmp")
+        tmp_path = Path(os.path.abspath(tmp_name))
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                yaml.dump(cfg, f, allow_unicode=True, default_flow_style=False)
+            os.replace(tmp_path, config_path)
+        except Exception:
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+            raise
+
     def _clear_bemfa_modified(self):
         """Set bemfa.modified=false in config.yaml after topic re-registration."""
         try:
@@ -334,11 +357,7 @@ class Server:
                     cfg = yaml.safe_load(f) or {}
             if cfg.get("bemfa", {}).get("modified"):
                 cfg["bemfa"]["modified"] = False
-                # Atomic write: write to temp file then rename
-                tmp_path = config_path.with_suffix(".tmp")
-                with open(tmp_path, "w") as f:
-                    yaml.dump(cfg, f, allow_unicode=True, default_flow_style=False)
-                os.replace(tmp_path, config_path)
+                self._atomic_write_yaml(config_path, cfg)
                 _LOGGER.info("Bemfa modified flag cleared")
         except Exception:
             _LOGGER.warning("Failed to clear bemfa modified flag", exc_info=True)
@@ -727,11 +746,7 @@ class Server:
             if "server" not in cfg:
                 cfg["server"] = {}
             cfg["server"]["log_level"] = level
-            # Atomic write: write to temp file then rename
-            tmp_path = config_path.with_suffix(".tmp")
-            with open(tmp_path, "w") as f:
-                yaml.dump(cfg, f, allow_unicode=True, default_flow_style=False)
-            os.replace(tmp_path, config_path)
+            self._atomic_write_yaml(config_path, cfg)
         except Exception:
             _LOGGER.warning("Failed to persist log level to config.yaml", exc_info=True)
         _LOGGER.info("Log level changed to %s", level)
@@ -1562,11 +1577,7 @@ class Server:
                 if old_names != new_names:
                     bemfa_existing["modified"] = True
 
-            # Atomic write: write to temp file then rename
-            tmp_path = config_path.with_suffix(".tmp")
-            with open(tmp_path, "w") as f:
-                yaml.dump(existing, f, allow_unicode=True, default_flow_style=False)
-            os.replace(tmp_path, config_path)
+            self._atomic_write_yaml(config_path, existing)
 
             _LOGGER.info("Config saved to %s, restarting...", config_path)
 

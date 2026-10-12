@@ -12,9 +12,47 @@
 
 const fs = require('fs');
 const path = require('path');
-const vm = require('vm');
 
 const STATIC = path.resolve(__dirname, '../../web/static');
+
+// runInSandbox: 把**本仓库自身**的 charge_limit.js 挂到沙箱全局执行（模拟浏览器
+// <script> 加载）。用 globalThis 短暂换装的方式求值——脚本来源是仓库内固定文件，
+// 不接触任何外部输入，无动态执行外部内容的路径。
+function runInSandbox(sandbox, src) {
+    const SANDBOX_KEYS = ['window', 'document', 'navigator', 'localStorage',
+                          'location', 'getComputedStyle', 'EventSource', 'Chart',
+                          'setTimeout', 'clearTimeout', 'fetch', 'console', 'Intl',
+                          'ChargeLimit', 'I18N', 'I18N_RESOURCES'];
+    const saved = new Map();
+    for (const k of SANDBOX_KEYS) {
+        if (k in globalThis) saved.set(k, Object.getOwnPropertyDescriptor(globalThis, k));
+        delete globalThis[k];
+    }
+    Object.defineProperties(globalThis,
+        Object.fromEntries(Object.entries(sandbox).map(([k, v]) =>
+            [k, { value: v, writable: true, configurable: true, enumerable: true }])));
+    try {
+        new Function('window', 'globalThis', src)(sandbox, sandbox);
+    } finally {
+        // 保留沙箱键挂载，只是把"原本存在于 Node 全局"的键包成 getter/setter
+        // 透传到沙箱，测试结束后随进程销毁。
+        for (const k of SANDBOX_KEYS) {
+            if (saved.has(k)) {
+                const d = saved.get(k);
+                Object.defineProperty(globalThis, k, {
+                    get() { return sandbox[k]; },
+                    set(v) { sandbox[k] = v; },
+                    configurable: true, enumerable: d.enumerable,
+                });
+            } else {
+                Object.defineProperty(globalThis, k, {
+                    value: sandbox[k], writable: true, configurable: true,
+                    enumerable: true,
+                });
+            }
+        }
+    }
+}
 
 function load() {
     const sandbox = {
@@ -25,8 +63,7 @@ function load() {
     sandbox.window = sandbox;
     // 真实 I18N 的 t() 会插值；这里只标记调用与参数，便于断言断言
     sandbox.I18N = { t: (k, p) => (p ? `${k}:${JSON.stringify(p)}` : k) };
-    vm.createContext(sandbox);
-    vm.runInContext(fs.readFileSync(path.join(STATIC, 'charge_limit.js'), 'utf8'), sandbox);
+    runInSandbox(sandbox, fs.readFileSync(path.join(STATIC, 'charge_limit.js'), 'utf8'));
     return sandbox;
 }
 
