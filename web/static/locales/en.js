@@ -8,6 +8,7 @@
     global.I18N_RESOURCES['en'] = {
         // ── Common ──
         common: {
+            initPartial: 'Some UI parts failed to load - please refresh',
             connect: 'Connect',
             disconnect: 'Disconnect',
             restart: 'Restart',
@@ -150,6 +151,8 @@
             unit: 'Wh',
             placeholder: 'Wh',
             off: 'Off',
+            enabled: 'Enabled',
+            used: 'Charged {{used}} Wh',
             once: 'Once',
             always: 'Always',
             fired: 'Triggered',
@@ -157,8 +160,30 @@
             set: 'Set',
             clear: 'Clear',
             saved: 'Charge limit saved',
+            modeSaved: 'Mode saved',
             cleared: 'Charge limit cleared',
-            saveFailed: 'Failed: {{msg}}'
+            saveFailed: 'Failed: {{msg}}',
+            // Two compact switches: card shows only these words, details in title
+            permanent: 'Always-on',
+            permanentHint: 'Always-on: no curve recorded, never auto-cut',
+            permanentOff: 'Click to turn always-on off',
+            permanentConfirm: 'Tap again',
+            permanentClearsLimit: 'Always-on clears this port\'s charge limit - tap again to confirm',
+            permanentAvg: 'Average power',
+            permanentAvgLast: 'Last average power',
+            permanentOut: 'This session',
+            permanentLastOut: 'Last session',
+            permanentNoOutput: 'No output yet',
+            permanentDurLabel: 'Duration',
+            permanentDurMin: '{{m}} min',
+            permanentDurHour: '{{h}} h {{m}} min',
+            permanentDurDay: '{{d}} d {{h}} h',
+            permanentDurDayOnly: '{{d}} d',
+            permanentNote: 'No curve recorded; energy stats still tracked',
+            fullOff: 'Auto',
+            fullOffHint: 'Switch this port off automatically once charging completes',
+            fullOffFired: 'Cut off after full',
+            permanentConflict: 'Not applicable to an always-on port'
         },
 
         // ── Charge history ──
@@ -192,7 +217,10 @@
             peakPowerUnit: 'Peak Power (W)',
             avgVoltageUnit: 'Avg Voltage (V)',
             avgCurrentUnit: 'Avg Current (A)',
-            yesterdayTime: 'Yesterday {{time}}'
+            yesterdayTime: 'Yesterday {{time}}',
+            // Always-on (permanent power) rows + the sliding window in the detail sheet
+            permanentWindow: 'Always-on',
+            noCurve: 'No curve for this session, stats only'
         },
 
         // ── Energy overview card ──

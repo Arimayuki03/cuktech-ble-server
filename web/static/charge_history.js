@@ -2,15 +2,6 @@
 const API = window.location.origin;
 let _sessionChart = null;
 
-// XSS 转义工具：本文件被 phone.html 与 index.html 共同加载，而 escapeHtml 原本
-// 只在 app.js 定义（app.js 仅被 index.html 加载），phone 页上 `${(window.escapeHtml
-// || (v => v))(proto)}` 恒走恒等函数，转义失效。这里提供本模块自有的定义并挂到
-// window；index 页上 app.js 会重复赋值同实现，幂等无害。
-function escapeHtml(v) {
-    return String(v ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
-}
-window.escapeHtml = escapeHtml;
-
 // Format timestamp to local time string
 function fmtTime(ts) {
     if (!ts) return '--';
@@ -33,6 +24,14 @@ function fmtDuration(sec) {
     return h > 0 ? `${h}h${m}m` : `${m}min`;
 }
 
+// 会话行 / 详情里的文本都来自 DB 与设备上报，进 innerHTML 与属性前一律转义。
+// （onclick 的函数名另有白名单校验，两者不是同一件事。）
+function esc(v) {
+    return String(v === undefined || v === null ? '' : v)
+        .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
+
 // Fetch energy stats
 async function fetchEnergyStats(period) {
     try {
@@ -53,26 +52,131 @@ async function fetchSessions(port, period, limit, page) {
     } catch (e) { return { sessions: [], total: 0, page: 1, pages: 1, error: String(e) }; }
 }
 
+// 会话行 / 详情里的文本都来自 DB 与设备上报，进 innerHTML 与属性前一律转义。
+// 本文件被 phone.html 与 index.html 共同加载（app.js 只在 index 页加载），
+// 所以转义助手必须是本模块自有的，不能依赖 app.js 的全局。
+// （onclick 的函数名另有白名单校验，两者不是同一件事。）
+function esc(v) {
+    return String(v === undefined || v === null ? '' : v)
+        .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
+
 let _dsTarget = 300;
 let _currentSessionId = null;
+// 长期供电（常供）会话的详情：
+//   _dsPermanent 当前详情是不是常供会话（服务端返回为准）
+// 常供曲线只在内存里保留 1 小时，且界面**不再提供窗口长度/左右滑动**——
+// 永远取"服务端能给的整段"（缺省窗口=内存保留时长）并贴最新，
+// 所以这里不再有窗口宽度/右端状态。
+let _dsPermanent = false;
 // 详情请求乱序守卫：sessionId 比对只能拦"会话已切换"，同会话内切 downsample
 // 档位（或语言切换等重查）时 sessionId 不变，旧响应仍可能覆盖新渲染——
 // 用单调递增序号保证只有最新一次请求能落笔。
-let _dsSeq = 0;
+let _dsReqToken = 0;
 
 function setDownsample(target) {
     _dsTarget = parseInt(target) || 0;
     if (_currentSessionId) showSessionDetail(_currentSessionId);
 }
 
+// 常供会话的曲线只在内存里留 1 小时，且**没有窗口长度/滑动控件**：
+// 永远取服务端能给的整段并贴最新（见 fetchSessionPoints）。所以这里只剩一件事要
+// 说明——"这次会话没有采样曲线"（只存了统计）。那张图区高度就是弹窗里最大的
+// 一块空白，没有曲线时应当把它整个收起来，只留这行说明。
+function ensureNoCurveNote(show) {
+    const detail = document.getElementById('sessionDetail');
+    if (!detail) return null;
+    let note = document.getElementById('sdNoCurveNote');
+    if (!note) {
+        note = document.createElement('div');
+        note.id = 'sdNoCurveNote';
+        note.className = 'sd-no-curve';
+        // 插到"标题行所在的那个容器"里、紧跟标题之后（图表区之前）。
+        // 不能按 #sessionDetail 的子节点算：桌面标题行在 .sd-sheet 内部，
+        // 插到 detail 下会落到弹窗外边，文字永远看不见。
+        const head = detail.querySelector('.sd-head') || detail.firstElementChild;
+        const host = (head && head.parentNode) || detail;
+        host.insertBefore(note, head ? head.nextSibling : host.firstChild);
+    }
+    if (note.dataset.key !== 'noCurve') {
+        note.dataset.key = 'noCurve';
+        note.textContent = I18N.t('charge.noCurve');
+    }
+    note.style.display = show ? '' : 'none';
+    return note;
+}
+
+// 详情里"只对曲线有意义"的控件（精度下拉 / 导出 CSV）：没有采样点时必须收起。
+//   · 常供会话的曲线只留在内存（不落库），导出端点读的是库 → 导出的是一张空表；
+//     精度（下采样）也只作用在曲线上，没有曲线时它调不动任何东西。
+//   · 没有任何采样点的会话（0Wh 已被清理）同理。
+// 两页都靠标记类挂钩子（.sd-curve-only）：桌面是"精度"整块 + 导出按钮，
+// 手机只有"精度"那一行（该页详情本来就没有导出按钮）。
+function setCurveControlsVisible(visible) {
+    document.querySelectorAll('.sd-curve-only').forEach(function (el) {
+        if (el.style) el.style.display = visible ? '' : 'none';
+    });
+}
+
+// 没有曲线时把图表区整个收起来（它的定高就是那块大空白）；有曲线时恢复。
+// 桌面是 .sd-chart 容器、手机是内联定高的 canvas 父节点，都从 canvas 往上找。
+function setSessionChartVisible(visible) {
+    const chart = document.getElementById('sessionChart');
+    if (!chart) return;
+    const box = chart.parentNode;
+    if (box && box.style) box.style.display = visible ? '' : 'none';
+}
+
+function showSessionDetailEmpty(permanent, stats, noCurve) {
+    const detail = document.getElementById('sessionDetail');
+    if (!detail) return;
+    detail.style.display = 'block';
+    const el = (id) => document.getElementById(id);
+    const startTs = stats && stats.start_time ? stats.start_time : null;
+    const endTs = stats && stats.end_time ? stats.end_time : null;
+    if (el('sdTitle')) {
+        if (permanent) {
+            el('sdTitle').textContent =
+                `${I18N.t('charge.permanentWindow')}${startTs ? ' · ' + fmtTime(startTs) : ''}`;
+        } else if (startTs) {
+            el('sdTitle').textContent = `${fmtTime(startTs)}${endTs ? ' → ' + fmtTime(endTs) : ''}`;
+        } else {
+            el('sdTitle').textContent = '--';
+        }
+    }
+    if (el('sdDuration')) el('sdDuration').textContent = stats ? fmtDuration(stats.duration_sec) : '--';
+    // 指标要么全填、要么全清：只填一半的话，上一个会话的 Wh/W/V/A 会挂在新标题下面
+    const metricIds = ['sdEnergy', 'sdAvgP', 'sdPeakP', 'sdAvgV', 'sdAvgI'];
+    if (stats) {
+        if (el('sdEnergy')) el('sdEnergy').textContent = (stats.total_wh || 0).toFixed(1);
+        if (el('sdAvgP')) el('sdAvgP').textContent = (stats.avg_power_w || 0).toFixed(1);
+        if (el('sdPeakP')) el('sdPeakP').textContent = (stats.peak_power_w || 0).toFixed(1);
+        if (el('sdAvgV')) el('sdAvgV').textContent = (stats.avg_voltage || 0).toFixed(1);
+        if (el('sdAvgI')) el('sdAvgI').textContent = (stats.avg_current || 0).toFixed(2);
+    } else {
+        metricIds.forEach((id) => { if (el(id)) el(id).textContent = '--'; });
+    }
+    if (_sessionChart) { _sessionChart.destroy(); _sessionChart = null; }
+    setSessionChartVisible(false);      // 没有曲线：收起定高的图表区（最大一块空白）
+    ensureNoCurveNote(!!noCurve);
+    setCurveControlsVisible(false);     // 没有曲线：精度下拉与导出按钮一并收起
+}
+
 // Fetch session detail points
 async function fetchSessionPoints(sessionId) {
     try {
-        const ds = _dsTarget > 0 ? `?downsample=${_dsTarget}` : '';
-        const res = await fetch(`${API}/api/sessions/${sessionId}/points${ds}`);
-        if (!res.ok) return { points: [], error: 'HTTP ' + res.status };
+        const q = [];
+        if (_dsTarget > 0) q.push(`downsample=${_dsTarget}`);
+        // 常供会话不再传 window/to：服务端缺省就是"内存保留时长（1 小时）+ 贴最新"，
+        // 界面也没有窗口控件可以改变它。
+        const res = await fetch(`${API}/api/sessions/${sessionId}/points${q.length ? '?' + q.join('&') : ''}`);
+        // fetch 不对 4xx/5xx reject：不检查 status 的话，服务端 400（例如 to 越界）
+        // 的错误体会被当成正常响应解析，面板静默变空白且没有任何提示。
+        // 返回 null 让调用方区分"加载失败"与"这次会话真的没有点"。
+        if (!res.ok) return null;
         return await res.json();
-    } catch (e) { return { points: [], error: String(e) }; }
+    } catch (e) { return null; }
 }
 
 // Render stats summary
@@ -131,22 +235,27 @@ function renderSessionList(containerId, sessions, onClick, fetchError) {
     }
     el.innerHTML = filtered.map(s => {
         const proto = s.protocol || '';
-        const protoHtml = proto ? `<span style="font-size:11px;color:var(--accent-ink);margin-left:6px;">${escapeHtml(proto)}</span>` : '';
+        const protoHtml = proto ? `<span style="font-size:11px;color:var(--accent-ink);margin-left:6px;">${esc(proto)}</span>` : '';
         const isActive = s.is_active;
+        // 长期供电状态只在"充电量限额"卡里体现，记录行不加徽标（行本身仍可点开
+        // 窗口详情：permanent 标记通过 data-* 传给详情浮层，不参与视觉渲染）。
+        const isPerm = !!s.permanent;
         const wh = (s.total_wh && s.total_wh > 0) ? s.total_wh.toFixed(1) : '0';
         const activeDot = isActive ? `<span style="display:inline-block;width:6px;height:6px;border-radius:50%;background:var(--dot-on,#34C759);margin-right:4px;animation:pulse 1.5s infinite;"></span>` : '';
         // 行原来是 div[onclick]，键盘/读屏用户打不开详情：补 role/tabindex/aria-label + 回车与空格
         const rowLabel = `${portNames[s.port] || s.port} ${fmtTime(s.start_time)} ${I18N.t('charge.energy', { wh })}`;
-        const open = onClick || 'showSessionDetail';
+        // 只有可信的标识符才能拼进 onclick 字符串：那是"可执行代码"不是属性值，
+        // 转义引号挡不住注入。非标识符（例如带参数的调用）一律退回默认处理函数。
+        const open = /^[A-Za-z_$][A-Za-z0-9_$]*$/.test(onClick || '') ? onClick : 'showSessionDetail';
         return `
-        <div class="session-item" data-id="${s.id}" onclick="(${open})(this.dataset.id)"
-             role="button" tabindex="0" aria-label="${rowLabel}"
-             onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();(${open})(this.dataset.id);}"
+        <div class="session-item" data-id="${s.id}" data-permanent="${isPerm ? 1 : 0}" onclick="(${open})(this.dataset.id, this.dataset.permanent === '1')"
+             role="button" tabindex="0" aria-label="${esc(rowLabel)}"
+             onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();(${open})(this.dataset.id, this.dataset.permanent === '1');}"
              style="display:flex;align-items:center;justify-content:space-between;padding:10px 0;border-bottom:1px solid rgba(128,128,128,0.1);cursor:pointer;">
             <div style="display:flex;align-items:center;gap:8px;flex:1;min-width:0;">
                 ${activeDot}
                 <div style="width:8px;height:8px;border-radius:50%;background:${portColors[s.port] || '#888'};flex-shrink:0;"></div>
-                <span style="font-size:13px;color:var(--text);flex-shrink:0;">${portNames[s.port] || s.port}</span>
+                <span style="font-size:13px;color:var(--text);flex-shrink:0;">${esc(portNames[s.port] || s.port)}</span>
                 <span style="font-size:12px;color:var(--text-dim);flex-shrink:0;">${fmtTime(s.start_time)}${!isActive && s.end_time ? ' ~ ' + fmtTime(s.end_time) : ''}</span>
                 ${protoHtml}
             </div>
@@ -156,19 +265,28 @@ function renderSessionList(containerId, sessions, onClick, fetchError) {
 }
 
 // Show session detail (chart + stats)
-async function showSessionDetail(sessionId) {
+async function showSessionDetail(sessionId, permanent) {
+    // 面板被关掉再打开同一条会话，用户眼里是"重新打开"，窗口要回到最新；
+    // 只按 id 判新会让上次滑到的位置残留下来（closeSessionDetail 没清状态）。
+    const detailEl = document.getElementById('sessionDetail');
+    const reopened = !detailEl || detailEl.style.display === 'none';
+    const isNew = reopened || String(sessionId) !== String(_currentSessionId);
     _currentSessionId = sessionId;
-    const seq = ++_dsSeq;
+    if (isNew) {
+        _dsPermanent = !!permanent;
+    } else if (permanent !== undefined) {
+        _dsPermanent = !!permanent;
+    }
+    // 详情里还有精度下拉等控件，点得比往返快时响应可能乱序回来：丢弃不是最后一次
+    // 请求的响应，否则统计/曲线会被旧载荷覆盖。
+    const reqToken = ++_dsReqToken;
     const data = await fetchSessionPoints(sessionId);
-    // 竞态守卫：seq 拦同会话内切 downsample 的乱序旧响应，sessionId 拦"会话已切换"
-    // （快速连点 A、B 时 A 的慢响应后到会覆盖 B 的图表，而导出按钮读的
-    // _currentSessionId 是 B——显示与导出内容错位）。
-    if (seq !== _dsSeq || sessionId !== _currentSessionId) return;
-    if (data.error) {
+    if (reqToken !== _dsReqToken) return;
+    if (!data) {
         // 失败路径不能静默：旧图表/旧数值继续挂着会误导（看起来像本次会话的数据），
-        // 且 seq 仍最新说明没有更新的请求在途，应当把错误显式画出来。
+        // 且 reqToken 仍最新说明没有更新的请求在途，应当把错误显式画出来。
         // 错误占位行由 JS 动态插入（两页 HTML 里都没有预留节点，且本模块不碰 HTML）。
-        console.warn('[charge_history] session points load failed:', data.error);
+        console.warn('[charge_history] session points load failed');
         const detail = document.getElementById('sessionDetail');
         if (detail) {
             detail.style.display = 'block';
@@ -190,22 +308,48 @@ async function showSessionDetail(sessionId) {
         }
         return;
     }
-    if (!data.points || data.points.length === 0) return;
+    // 服务端是常供与否的唯一权威（列表里的标记可能已过时），且必须能双向翻转：
+    // 端口中途退出常供后，服务端走 DB 回落分支会给出 permanent=false。
+    if ('permanent' in data) _dsPermanent = !!data.permanent;
+    const stats = data.stats || null;
+    const points = data.points || [];
+    if (points.length === 0) {
+        // 常供会话不落曲线点：会话结束后只剩统计（活跃但刚起步时也走这里）
+        if (stats && (_dsPermanent || stats.start_time)) {
+            showSessionDetailEmpty(_dsPermanent, stats, !!data.no_curve);
+        }
+        return;
+    }
 
-    const points = data.points;
+    setSessionChartVisible(true);       // 有曲线：恢复图表区并收起"没有曲线"说明
+    ensureNoCurveNote(false);
+    // 常供会话有曲线（内存窗口）但库里没有点：导出仍是空表，精度也只对库里的点
+    // 有意义 → 一并收起
+    setCurveControlsVisible(!_dsPermanent);
+
     const totalWh = points.reduce((sum, p, i) => {
         if (i === 0) return 0;
         const dt = (p.timestamp - points[i-1].timestamp) / 3600;
         return sum + ((points[i-1].power + p.power) / 2) * dt;
     }, 0);
-    const duration = points[points.length-1].timestamp - points[0].timestamp;
-    const avgPower = duration > 0 ? (totalWh / (duration / 3600)) : 0;
+    const spanSec = points[points.length-1].timestamp - points[0].timestamp;
     let peakPower = 0;
     for (let i = 0; i < points.length; i++) {
         if (points[i].power > peakPower) peakPower = points[i].power;
     }
     const avgVoltage = points.reduce((s, p) => s + p.voltage, 0) / points.length;
     const avgCurrent = points.reduce((s, p) => s + p.current, 0) / points.length;
+
+    // 统计口径：常供会话恒用服务端给的**整个会话**统计（窗口里只有最近一段，
+    // 按窗口现算会偏小）；普通会话保持原样（活跃会话 DB 行还没写总量，用点现算）。
+    const base = _dsPermanent && stats ? stats : null;
+    const duration = base ? (base.duration_sec || 0) : spanSec;
+    const energy = base ? (base.total_wh || 0) : totalWh;
+    const avgPower = base ? (base.avg_power_w || 0)
+        : (spanSec > 0 ? (totalWh / (spanSec / 3600)) : 0);
+    const peak = base ? (base.peak_power_w || 0) : peakPower;
+    const avgV = base ? (base.avg_voltage || 0) : avgVoltage;
+    const avgI = base ? (base.avg_current || 0) : avgCurrent;
 
     // Show detail panel
     const detail = document.getElementById('sessionDetail');
@@ -215,13 +359,16 @@ async function showSessionDetail(sessionId) {
         const prevErr = document.getElementById('sdError');
         if (prevErr) prevErr.style.display = 'none';
         const el = (id) => document.getElementById(id);
-        if (el('sdTitle')) el('sdTitle').textContent = `${fmtTime(points[0].timestamp)} → ${fmtTime(points[points.length-1].timestamp)}`;
+        const title = _dsPermanent
+            ? I18N.t('charge.permanentWindow')
+            : `${fmtTime(points[0].timestamp)} → ${fmtTime(points[points.length-1].timestamp)}`;
+        if (el('sdTitle')) el('sdTitle').textContent = title;
         if (el('sdDuration')) el('sdDuration').textContent = fmtDuration(duration);
-        if (el('sdEnergy')) el('sdEnergy').textContent = totalWh.toFixed(1);
+        if (el('sdEnergy')) el('sdEnergy').textContent = energy.toFixed(1);
         if (el('sdAvgP')) el('sdAvgP').textContent = avgPower.toFixed(1);
-        if (el('sdPeakP')) el('sdPeakP').textContent = peakPower.toFixed(1);
-        if (el('sdAvgV')) el('sdAvgV').textContent = avgVoltage.toFixed(1);
-        if (el('sdAvgI')) el('sdAvgI').textContent = avgCurrent.toFixed(2);
+        if (el('sdPeakP')) el('sdPeakP').textContent = peak.toFixed(1);
+        if (el('sdAvgV')) el('sdAvgV').textContent = avgV.toFixed(1);
+        if (el('sdAvgI')) el('sdAvgI').textContent = avgI.toFixed(2);
 
         // Render chart
         renderSessionChart(points);
